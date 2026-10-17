@@ -13,6 +13,8 @@ def answer(body):
         return "ls /nonexistent-terhm" if "stubborn" in req else "echo fixed"
     if "does not work here" in last: return "ls -la"
     if "100mb" in req: return " find . -type f -size +100M -exec ls -lh {} +"
+    if "multifence" in req: return "```bash\nls -la\n```"
+    if "think" in req: return "<think>\n\n</think>\n\ngit status"
     if "fence" in req: return " ```bash"
     if "wrapped" in req: return " `ls -la`"
     if "dollar" in req: return " $ ls -la"

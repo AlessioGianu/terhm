@@ -1,6 +1,13 @@
 # terhm
 
-A terminal that works as usual until you press **Ctrl+G**: describe what you want to do in plain language and a small **offline** model ([nl2sh-1.5b](https://huggingface.co/ThorOdinson246/nl2sh-1.5b-Q4_K_M), Qwen2.5-Coder-1.5B fine-tuned to write shell commands, Q4 quantized) proposes the command, based on the current directory, git and recent commands.
+A terminal that works as usual until you press **Ctrl+G**: describe what you want to do in plain language and a small **offline** model proposes the command, based on the current directory, the project in it (make, docker, npm, python, ROS 2…), git, the tools you have installed and recent commands.
+
+Two models to choose from at install time (both Q4 quantized, CPU only):
+
+| Model | Download | RAM | Notes |
+|---|---|---|---|
+| [nl2sh-1.5b](https://huggingface.co/ThorOdinson246/nl2sh-1.5b-Q4_K_M) (default) | ~1 GB | ~1.5 GB | Qwen2.5-Coder-1.5B fine-tuned to write shell commands. Fast. |
+| [Qwen3.5-4B](https://huggingface.co/Qwen/Qwen3.5-4B) ([GGUF](https://huggingface.co/unsloth/Qwen3.5-4B-GGUF)) | ~2.7 GB | ~4 GB | General model, slower but smarter; makes better use of the project context. Thinking mode is turned off. |
 
 ```
 $ find files bigger than 100MB      ← type, then press Ctrl+G
@@ -16,11 +23,11 @@ git clone https://github.com/YOUR-USER/terhm && cd terhm
 ./install.sh
 ```
 
-The script downloads `llama-server` (llama.cpp) and the model (~1 GB, checksum verified), installs a **systemd user service** that starts at boot (with `loginctl enable-linger`) and adds the plugin to bash, zsh and fish (asking first).
+The script asks which model to use, downloads `llama-server` (llama.cpp) and the model (checksum verified), installs a **systemd user service** that starts at boot (with `loginctl enable-linger`) and adds the plugin to bash, zsh and fish (asking first).
 
-Requirements: Linux (x86_64 or arm64), `systemd`, `curl`, `jq`, `tar`, ~1.5 GB of free RAM.
+Requirements: Linux (x86_64 or arm64), `systemd`, `curl`, `jq`, `tar`, ~1.5 GB of free RAM (~4 GB for Qwen3.5-4B).
 
-Useful options: `--yes`, `--model-file ./file.gguf`, `--llama-server /path`, `--no-service`, `--no-shell-rc`. For another GGUF model with a chat template: `TERHM_MODEL_URL=... ./install.sh`.
+Useful options: `--model nl2sh` or `--model qwen3.5-4b` (skips the question), `--yes`, `--model-file ./file.gguf`, `--update-llama` (Qwen3.5 needs a recent llama.cpp), `--llama-server /path`, `--no-service`, `--no-shell-rc`. For another GGUF model with a chat template: `TERHM_MODEL_URL=... ./install.sh`. To switch model later, run `./install.sh` again and pick the other one.
 
 ## Usage
 
@@ -40,20 +47,28 @@ The `terhm ›` prompt is bash-only for now; in zsh and fish `Ctrl+G` on an empt
 
 If the command looks dangerous (`rm -rf`, `sudo`, `dd`, `mkfs`, `curl | sh`…) a warning is shown.
 
-Commands: `terhm ask "..."`, `terhm fix --status N -- "command"`, `terhm doctor`, `terhm status`.
+Commands: `terhm ask "..."`, `terhm fix --status N -- "command"`, `terhm context` (shows what is sent to the model from the current directory), `terhm doctor`, `terhm status`.
 
 ## Configuration
 
-`~/.config/terhm/config` (see `config/terhm.conf`): port, timeout, number of context files, temperature, retries, regex of dangerous commands. To change the hotkey set `TERHM_KEY` before the plugin's `source` (zsh `'^X'`, bash `'\C-x'`, fish `\cx`).
+`~/.config/terhm/config` (see `config/terhm.conf`): model profile (`TERHM_MODEL`), port, timeout, number of context files, temperature, retries, regex of dangerous commands. To change the hotkey set `TERHM_KEY` before the plugin's `source` (zsh `'^X'`, bash `'\C-x'`, fish `\cx`).
 
 ## How it works
 
 ```
-Ctrl+G → shell plugin → terhm ask → HTTP localhost:11500/v1/chat/completions → llama-server (nl2sh-1.5b) → command in the buffer
+Ctrl+G → shell plugin → terhm ask → HTTP localhost:11500/v1/chat/completions → llama-server (nl2sh-1.5b or Qwen3.5-4B) → command in the buffer
 ```
 
-- System prompt in `prompts/system.txt` (the one recommended for nl2sh, plus OS and shell), temperature 0 and `repeat_penalty` 1.08 as the model card suggests.
-- Context sent: directory, git branch, first 40 entries of the directory (directories first, then files, hidden ones last); recent commands and exit code only when you ask to fix a failed command. No file contents, no environment variables.
+- System prompt in `prompts/system.txt` (the one recommended for nl2sh, plus OS, shell and how to use the context), temperature 0. nl2sh uses `repeat_penalty` 1.08 as its model card suggests; Qwen3.5 uses the model card's non-thinking settings (`top_k` 20, `top_p` 0.8) with `enable_thinking: false`.
+- Context sent (see it with `terhm context`):
+  - directory, git branch and number of changed files, first 40 entries of the directory (directories first, then files, hidden ones last);
+  - **project**, in the current directory and at the git root: make targets, docker compose services, Dockerfiles, npm/pnpm/yarn/bun scripts, python tool (pip, uv, poetry, pipenv) and virtualenv, cmake, cargo, go, maven, gradle, helm, terraform…;
+  - **ROS 2**: the nearest colcon workspace (built or not, sourced or not), its packages with build type and executables (`console_scripts` of `ament_python` packages, `add_executable` of `ament_cmake` ones) and launch files;
+  - **session**: active virtualenv/conda env, `ROS_DISTRO`, Wayland/X11, SSH, container, tmux, root;
+  - **installed tools**: docker (and whether `docker compose` v2 is there and docker needs sudo), make, python, node, cargo, ros2, colcon, xclip/wl-copy, rg/fd…;
+  - recent commands and exit code only when you ask to fix a failed command.
+
+  Only file names and a few small build files (Makefile, package.json, compose file, package.xml, setup.py) are read; no other file contents and no environment variable values except the names above. `.env` files are never read. Turn parts off with `TERHM_PROJECT_CONTEXT=0` and `TERHM_TOOLS_CONTEXT=0`.
 - No hand-written rules for specific commands: everything that ends up on the line is decided by the model.
 - **Check without running**: before proposing it, terhm checks the command's syntax (`bash -n`, `zsh -n` or `fish -n`) and that the programs it uses exist (including your shell's aliases and functions). If something is wrong, it sends the problem back to the model and retries (up to `TERHM_RETRIES`, default 2). Turn it off with `TERHM_CHECK=0`.
 - The server listens on `127.0.0.1` only. No telemetry.
@@ -72,6 +87,6 @@ shellcheck -S warning bin/terhm install.sh shell/terhm.bash
 
 ## Limitations
 
-A 1.5B model makes mistakes and was trained mostly on English requests: always read the command before pressing Enter. The default GGUF file is `nl2sh-1.5b-Q4_K_M.gguf` from the `ThorOdinson246/nl2sh-1.5b-Q4_K_M` repo (Apache-2.0); if the name changes use `TERHM_MODEL_URL`.
+Small models make mistakes (Qwen3.5-4B fewer than nl2sh-1.5b, which was trained mostly on English requests): always read the command before pressing Enter. The default GGUF file is `nl2sh-1.5b-Q4_K_M.gguf` from the `ThorOdinson246/nl2sh-1.5b-Q4_K_M` repo (Apache-2.0); Qwen3.5-4B is `Qwen3.5-4B-Q4_K_M.gguf` from `unsloth/Qwen3.5-4B-GGUF` (Apache-2.0). If a name changes use `TERHM_MODEL_URL`.
 
 License: MIT

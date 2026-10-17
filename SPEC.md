@@ -73,7 +73,7 @@ Principles: no extra windows, no interruption of the flow; the model suggests, i
 
 ## 7. Model and inference
 
-- **Model:** nl2sh-1.5b (Qwen2.5-Coder-1.5B fine-tuned for NL→shell) in GGUF format, Q4_K_M.
+- **Model:** chosen at install time: nl2sh-1.5b (Qwen2.5-Coder-1.5B fine-tuned for NL→shell, default) or Qwen3.5-4B (non-thinking mode), GGUF Q4_K_M. The profile (`TERHM_MODEL`) sets sampling, stop strings and output length.
 - **Default parameters:** `temperature 0.1`, `n_predict 128`, `ctx 2048`, `threads = nproc/2`.
 - **System prompt** in `prompts/system.txt`, with 3–5 few-shot examples in the user's language.
 - Optional **GBNF grammar** to force a single line with no markdown or explanations.
@@ -90,6 +90,10 @@ os: Linux 6.8
 git: branch main, 3 files modified
 last exit code: 1
 recent commands: npm run build; ls; cd site
+project: node, package manager pnpm, scripts: dev build test
+ros2 workspace: ../.., built, not sourced, packages: my_robot (ament_python: talker)
+session: python virtualenv active; desktop: Wayland
+installed tools: docker docker-compose-v2 make python3 ros2 colcon wl-copy …
 files: package.json src/ public/ README.md …
 ```
 

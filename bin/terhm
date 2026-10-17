@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
-# terhm - turns natural language into shell commands with a local model (nl2sh-1.5b).
-# Usage: terhm ask "text" | terhm fix "command" | terhm danger "command" | terhm doctor | terhm status
+# terhm - turns natural language into shell commands with a local model (nl2sh-1.5b or Qwen3.5-4B).
+# Usage: terhm ask "text" | terhm fix "command" | terhm danger "command" | terhm context | terhm doctor | terhm status
 set -uo pipefail
 
-TERHM_VERSION="0.2.0"
+TERHM_VERSION="0.3.0"
 CONFIG_FILE="${TERHM_CONFIG:-${XDG_CONFIG_HOME:-$HOME/.config}/terhm/config}"
 # shellcheck disable=SC1090
 [ -f "$CONFIG_FILE" ] && . "$CONFIG_FILE"
@@ -12,10 +12,28 @@ CONFIG_FILE="${TERHM_CONFIG:-${XDG_CONFIG_HOME:-$HOME/.config}/terhm/config}"
 : "${TERHM_PORT:=11500}"
 : "${TERHM_TIMEOUT:=20}"
 : "${TERHM_FILES:=40}"
-: "${TERHM_N_PREDICT:=64}"
 : "${TERHM_TEMPERATURE:=0}"
-: "${TERHM_REPEAT_PENALTY:=1.08}"
 : "${TERHM_RETRIES:=2}"          # extra attempts when the proposed command fails the check
+
+# Model profile, written to the config by install.sh. Each profile has its own defaults
+# (the config or the environment can still override every value).
+: "${TERHM_MODEL:=nl2sh}"
+case "$TERHM_MODEL" in
+  qwen*)
+    # Qwen3.5 instruct mode (thinking off). The model may answer in a ``` block, so
+    # stop at the end of the block or at a blank line rather than at the first newline.
+    : "${TERHM_N_PREDICT:=160}"; : "${TERHM_REPEAT_PENALTY:=1.0}"
+    : "${TERHM_TOP_K:=20}"; : "${TERHM_TOP_P:=0.8}"
+    : "${TERHM_NO_THINK:=1}"; STOP_JSON='["\n```", "\n\n"]' ;;
+  *)
+    # nl2sh: values from the model card, one line of output
+    : "${TERHM_TOP_K:=40}"; : "${TERHM_TOP_P:=0.9}"
+    : "${TERHM_NO_THINK:=0}"; STOP_JSON='["\n"]' ;;
+esac
+: "${TERHM_N_PREDICT:=64}"
+: "${TERHM_REPEAT_PENALTY:=1.08}"
+: "${TERHM_PROJECT_CONTEXT:=1}"  # project type, build targets, scripts, services, ROS 2 workspace
+: "${TERHM_TOOLS_CONTEXT:=1}"    # developer tools installed on the system
 
 DEFAULT_DANGEROUS='(^|[;&|[:space:]])(sudo|su|doas|dd|mkfs[.a-z0-9]*|shred|wipefs|fdisk|parted)([[:space:]]|$)|rm[[:space:]]+(-[a-zA-Z]*[rf][a-zA-Z]*|--recursive|--force)|(chmod|chown)[[:space:]]+-[a-zA-Z]*R|>[[:space:]]*/dev/(sd|nvme|vd)|(curl|wget)[^|]*\|[[:space:]]*(sudo[[:space:]]+)?(ba|z)?sh|:\(\)[[:space:]]*\{'
 : "${TERHM_DANGEROUS:=$DEFAULT_DANGEROUS}"
@@ -50,13 +68,250 @@ list_files() {
   [ "${#out[@]}" -gt 0 ] && printf '%s ' "${out[@]}"
 }
 
-build_context() {
-  local branch="" hist
-  if command -v git >/dev/null 2>&1; then
-    branch=$(git symbolic-ref --short -q HEAD 2>/dev/null || true)
+# --- project and session context ----------------------------------------
+# Everything below only looks at file names and a few small build files (Makefile,
+# package.json, compose file, package.xml, setup.py). No other file contents, no
+# environment variable values except the names of the active environments.
+
+# up to N words from stdin, joined by spaces
+_words() { awk -v n="$1" 'NF && !seen[$0]++ { if (c++ < n) printf "%s%s", (c > 1 ? " " : ""), $0 }'; }
+
+make_targets() { # Makefile
+  grep -E '^[A-Za-z0-9_][A-Za-z0-9_./-]*[[:space:]]*:([^=]|$)' "$1" 2>/dev/null \
+    | sed -E 's/[[:space:]]*:.*//' | grep -v '%' | _words 15
+}
+
+compose_services() { # services of a compose file (top-level keys under "services:")
+  awk '
+    /^services:[[:space:]]*$/ { in_s = 1; next }
+    in_s && /^[^[:space:]#]/ { in_s = 0 }
+    in_s && /^[[:space:]]+[A-Za-z0-9_.-]+:/ {
+      ind = match($0, /[^[:space:]]/)
+      if (!want) want = ind
+      if (ind == want) { s = $0; sub(/^[[:space:]]+/, "", s); sub(/:.*/, "", s); print s }
+    }' "$1" 2>/dev/null | _words 12
+}
+
+npm_scripts() { jq -r '.scripts // {} | keys[]' "$1" 2>/dev/null | _words 15; }
+
+# "name build_type" of a ROS 2 package.xml
+ros_pkg_info() {
+  local name bt
+  name=$(sed -n 's:.*<name>[[:space:]]*\([^<[:space:]]*\)[[:space:]]*</name>.*:\1:p' "$1" | head -n1)
+  bt=$(sed -n 's:.*<build_type>[[:space:]]*\([^<[:space:]]*\)[[:space:]]*</build_type>.*:\1:p' "$1" | head -n1)
+  [ -n "$name" ] && printf '%s %s' "$name" "${bt:-ament_cmake}"
+}
+
+# executables of a ROS 2 package: console_scripts of setup.py/setup.cfg (ament_python)
+# or add_executable of CMakeLists.txt (ament_cmake)
+ros_pkg_execs() {
+  local d="$1"
+  {
+    [ -f "$d/setup.py" ] && grep -oE "['\"][[:space:]]*[A-Za-z0-9_-]+[[:space:]]*=[[:space:]]*[A-Za-z0-9_.]+:[A-Za-z0-9_]+" "$d/setup.py" \
+      | sed -E "s/^['\"][[:space:]]*//; s/[[:space:]]*=.*//"
+    [ -f "$d/setup.cfg" ] && grep -oE '^[[:space:]]*[A-Za-z0-9_-]+[[:space:]]*=[[:space:]]*[A-Za-z0-9_.]+:[A-Za-z0-9_]+' "$d/setup.cfg" \
+      | sed -E 's/^[[:space:]]*//; s/[[:space:]]*=.*//'
+    [ -f "$d/CMakeLists.txt" ] && grep -oE 'add_executable\([[:space:]]*[A-Za-z0-9_-]+' "$d/CMakeLists.txt" \
+      | sed -E 's/add_executable\([[:space:]]*//'
+  } 2>/dev/null | _words 8
+}
+
+ros_launch_files() { # launch files of a package or workspace, names only
+  find "$1" -maxdepth "${2:-3}" \( -name build -o -name install -o -name log -o -name .git \) -prune -o \
+    -type f \( -name '*.launch.py' -o -name '*.launch.xml' -o -name '*.launch.yaml' -o -name '*.launch' \) -print 2>/dev/null \
+    | sed 's:.*/::' | _words 8
+}
+
+# Nearest ROS 2 (colcon) workspace: a directory with src/ that contains package.xml
+# files, starting from the current directory and going up at most 6 levels.
+ros_workspace() {
+  local d="$PWD" i=0
+  while [ "$i" -le 6 ] && [ -n "$d" ]; do
+    if [ -d "$d/src" ] && [ -n "$(find "$d/src" -maxdepth 4 -name package.xml -print -quit 2>/dev/null)" ]; then
+      printf '%s' "$d"; return 0
+    fi
+    [ "$d" = / ] && break
+    [ "$d" = "$HOME" ] && break
+    d=$(dirname "$d"); i=$((i + 1))
+  done
+  return 1
+}
+
+# where (relative to the current directory) a path is: "" for ., otherwise " in DIR"
+_where() { [ "$1" = "$PWD" ] && return; printf ' in %s' "$(_rel "$1")"; }
+
+# path relative to the current directory when it is a parent or a child, else with ~
+_rel() {
+  local r
+  r=$(realpath -s --relative-to="$PWD" "$1" 2>/dev/null) || r=""
+  case "$r" in ""|*[!./]*../*) printf '%s' "${1/#$HOME/\~}" ;; *) printf '%s' "$r" ;; esac
+}
+
+# One line per project type found in directory $1.
+scan_project() {
+  local d="$1" w f t pm venv
+  w=$(_where "$d")
+  for f in Makefile makefile GNUmakefile; do
+    if [ -f "$d/$f" ]; then
+      t=$(make_targets "$d/$f")
+      printf 'make: %s%s%s\n' "$f" "$w" "${t:+, targets: $t}"; break
+    fi
+  done
+  [ -f "$d/CMakeLists.txt" ] && [ ! -f "$d/package.xml" ] && \
+    printf 'cmake: CMakeLists.txt%s%s\n' "$w" "$([ -d "$d/build" ] && printf ', build/ exists')"
+  [ -f "$d/meson.build" ] && printf 'meson: meson.build%s\n' "$w"
+  for f in justfile Justfile .justfile; do [ -f "$d/$f" ] && { printf 'just: %s%s\n' "$f" "$w"; break; }; done
+  for f in Taskfile.yml Taskfile.yaml; do [ -f "$d/$f" ] && { printf 'task: %s%s\n' "$f" "$w"; break; }; done
+  for f in compose.yaml compose.yml docker-compose.yml docker-compose.yaml; do
+    if [ -f "$d/$f" ]; then
+      t=$(compose_services "$d/$f")
+      printf 'docker compose: %s%s%s\n' "$f" "$w" "${t:+, services: $t}"; break
+    fi
+  done
+  t=$(cd "$d" 2>/dev/null && shopt -s nullglob && for f in Dockerfile Containerfile Dockerfile.* *.Dockerfile; do
+        [ -f "$f" ] && printf '%s\n' "$f"; done | _words 5)
+  [ -n "$t" ] && printf 'docker: %s%s\n' "$t" "$w"
+  if [ -f "$d/package.json" ]; then
+    pm=npm
+    [ -f "$d/pnpm-lock.yaml" ] && pm=pnpm
+    [ -f "$d/yarn.lock" ] && pm=yarn
+    { [ -f "$d/bun.lockb" ] || [ -f "$d/bun.lock" ]; } && pm=bun
+    t=$(npm_scripts "$d/package.json")
+    printf 'node: package.json%s, package manager %s%s%s\n' "$w" "$pm" "${t:+, scripts: $t}" \
+      "$([ -d "$d/node_modules" ] || printf ', node_modules/ missing (not installed)')"
   fi
+  if [ -f "$d/pyproject.toml" ] || [ -f "$d/requirements.txt" ] || [ -f "$d/setup.py" ] || [ -f "$d/Pipfile" ]; then
+    if [ ! -f "$d/package.xml" ]; then
+      pm=pip
+      [ -f "$d/Pipfile" ] && pm=pipenv
+      [ -f "$d/poetry.lock" ] && pm=poetry
+      [ -f "$d/uv.lock" ] && pm=uv
+      t=$(cd "$d" && ls pyproject.toml requirements*.txt setup.py Pipfile 2>/dev/null | _words 4)
+      venv=""
+      for f in .venv venv env; do [ -f "$d/$f/bin/activate" ] && { venv="$f/"; break; }; done
+      printf 'python: %s%s, tool %s%s%s\n' "$t" "$w" "$pm" "${venv:+, virtualenv $venv}" \
+        "$([ -f "$d/manage.py" ] && printf ', django manage.py')"
+    fi
+  fi
+  [ -f "$d/Cargo.toml" ] && printf 'rust: Cargo.toml%s (cargo)\n' "$w"
+  [ -f "$d/go.mod" ] && printf 'go: go.mod%s\n' "$w"
+  [ -f "$d/pom.xml" ] && printf 'java: pom.xml%s (maven%s)\n' "$w" "$([ -x "$d/mvnw" ] && printf ', ./mvnw')"
+  { [ -f "$d/build.gradle" ] || [ -f "$d/build.gradle.kts" ]; } && printf 'java/kotlin: gradle%s%s\n' "$w" "$([ -x "$d/gradlew" ] && printf ', ./gradlew')"
+  [ -f "$d/Gemfile" ] && printf 'ruby: Gemfile%s (bundler)\n' "$w"
+  [ -f "$d/composer.json" ] && printf 'php: composer.json%s\n' "$w"
+  [ -f "$d/Chart.yaml" ] && printf 'helm chart: Chart.yaml%s\n' "$w"
+  [ -f "$d/kustomization.yaml" ] && printf 'kubernetes: kustomization.yaml%s\n' "$w"
+  [ -n "$(find "$d" -maxdepth 1 -name '*.tf' -print -quit 2>/dev/null)" ] && printf 'terraform: *.tf%s\n' "$w"
+  [ -f "$d/Vagrantfile" ] && printf 'vagrant: Vagrantfile%s\n' "$w"
+  [ -f "$d/flake.nix" ] && printf 'nix: flake.nix%s\n' "$w"
+  [ -f "$d/.devcontainer/devcontainer.json" ] && printf 'devcontainer: .devcontainer/%s\n' "$w"
+  [ -f "$d/.env" ] && printf 'env file: .env%s (not read)\n' "$w"
+  return 0
+}
+
+ros_context() {
+  local ws pkg info execs launch pkgs="" f n built sourced
+  # current directory (or a parent, up to the workspace) is a ROS 2 package
+  pkg=""; f="$PWD"
+  while [ -n "$f" ] && [ "$f" != / ] && [ "$f" != "$HOME" ]; do
+    [ -f "$f/package.xml" ] && { pkg="$f"; break; }
+    [ -d "$f/src" ] && break
+    f=$(dirname "$f")
+  done
+  if [ -n "$pkg" ] && info=$(ros_pkg_info "$pkg/package.xml"); then
+    execs=$(ros_pkg_execs "$pkg"); launch=$(ros_launch_files "$pkg" 3)
+    printf 'ros2 package: %s (%s)%s%s%s\n' "${info% *}" "${info#* }" "$(_where "$pkg")" \
+      "${execs:+, executables: $execs}" "${launch:+, launch files: $launch}"
+  fi
+  if ws=$(ros_workspace); then
+    n=0
+    while IFS= read -r f; do
+      info=$(ros_pkg_info "$f") || continue
+      execs=$(ros_pkg_execs "$(dirname "$f")")
+      pkgs+="${pkgs:+; }${info% *} (${info#* }${execs:+: $execs})"
+      n=$((n + 1)); [ "$n" -ge 12 ] && break
+    done < <(find "$ws/src" -maxdepth 4 \( -name build -o -name install -o -name log -o -name .git \) -prune -o \
+               -name package.xml -print 2>/dev/null | sort)
+    built="not built yet (no install/)"
+    [ -f "$ws/install/setup.bash" ] && built="built (install/setup.bash exists)"
+    sourced="not sourced"
+    case ":${AMENT_PREFIX_PATH:-}:${COLCON_PREFIX_PATH:-}:" in *":$ws/install"*) sourced="sourced" ;; esac
+    printf 'ros2 workspace: %s, colcon, %s, %s%s\n' "$(_rel "$ws")" "$built" "$sourced" "${pkgs:+, packages: $pkgs}"
+    launch=$(ros_launch_files "$ws/src" 5)
+    [ -n "$launch" ] && printf 'ros2 launch files: %s\n' "$launch"
+  fi
+  return 0
+}
+
+# Project root: the git top level if inside a repo, otherwise the current directory.
+project_context() {
+  local root out
+  root=$(git rev-parse --show-toplevel 2>/dev/null || true)
+  out=$(scan_project "$PWD")
+  if [ -n "$root" ] && [ "$root" != "$PWD" ]; then out+=$'\n'$(scan_project "$root"); fi
+  out+=$'\n'$(ros_context)
+  printf '%s\n' "$out" | sed '/^$/d' | head -n 16
+}
+
+# Active environments and session type (names only).
+session_context() {
+  local env=() s
+  [ -n "${VIRTUAL_ENV:-}" ] && env+=("python virtualenv active: ${VIRTUAL_ENV/#$HOME/\~}")
+  [ -n "${CONDA_DEFAULT_ENV:-}" ] && env+=("conda env active: $CONDA_DEFAULT_ENV")
+  [ -n "${ROS_DISTRO:-}" ] && env+=("ROS 2 $ROS_DISTRO sourced${ROS_DOMAIN_ID:+ (ROS_DOMAIN_ID=$ROS_DOMAIN_ID)}")
+  if [ -n "${WAYLAND_DISPLAY:-}" ]; then env+=("desktop: Wayland")
+  elif [ -n "${DISPLAY:-}" ]; then env+=("desktop: X11")
+  else env+=("no graphical display")
+  fi
+  [ -n "${SSH_CONNECTION:-}${SSH_TTY:-}" ] && env+=("over SSH")
+  { [ -f /.dockerenv ] || [ -f /run/.containerenv ]; } && env+=("inside a container")
+  grep -qi microsoft /proc/version 2>/dev/null && env+=("WSL")
+  [ -n "${TMUX:-}" ] && env+=("inside tmux")
+  [ "$(id -u)" = 0 ] && env+=("running as root (no sudo needed)")
+  [ "${#env[@]}" -gt 0 ] || return 0
+  s=$(printf '%s; ' "${env[@]}"); printf 'session: %s\n' "${s%; }"
+}
+
+# Developer tools installed, so the model picks the ones that exist
+# (docker compose vs docker-compose, wl-copy vs xclip, fd vs find...).
+tools_context() {
+  local t have=() d
+  for t in docker podman docker-compose kubectl helm minikube make cmake ninja meson just gcc g++ clang \
+           python3 pip pip3 uv poetry pipenv conda node npm pnpm yarn bun cargo go java mvn gradle \
+           ros2 colcon rosdep gh glab rg fd fdfind fzf bat jq yq xclip xsel wl-copy tmux systemctl \
+           snap flatpak nvim vim code; do
+    command -v "$t" >/dev/null 2>&1 && have+=("$t")
+  done
+  if command -v docker >/dev/null 2>&1; then
+    for d in "$HOME/.docker/cli-plugins" /usr/local/lib/docker/cli-plugins /usr/libexec/docker/cli-plugins \
+             /usr/lib/docker/cli-plugins /usr/local/libexec/docker/cli-plugins; do
+      [ -x "$d/docker-compose" ] && { have+=("docker-compose-v2(use 'docker compose')"); break; }
+    done
+    # docker without sudo: root, docker group, rootless socket or DOCKER_HOST
+    if [ "$(id -u)" != 0 ] && [ -z "${DOCKER_HOST:-}" ] && [ ! -S "${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/docker.sock" ] \
+       && ! id -nG 2>/dev/null | tr ' ' '\n' | grep -qx docker; then
+      have+=("(docker needs sudo: user not in docker group)")
+    fi
+  fi
+  [ "${#have[@]}" -gt 0 ] && printf 'installed tools: %s\n' "${have[*]}"
+}
+
+git_context() {
+  local branch n up
+  branch=$(git symbolic-ref --short -q HEAD 2>/dev/null || true)
+  [ -n "$branch" ] || return 0
+  n=$(git status --porcelain 2>/dev/null | head -n 500 | wc -l)
+  up=$(git rev-parse --abbrev-ref --symbolic-full-name '@{u}' 2>/dev/null || true)
+  printf 'git branch: %s, %s changed files%s\n' "$branch" "$((n))" "${up:+, tracking $up}"
+}
+
+build_context() {
+  local hist
   printf 'cwd: %s\n' "$PWD"
-  if [ -n "$branch" ]; then printf 'git branch: %s\n' "$branch"; fi
+  if command -v git >/dev/null 2>&1; then git_context; fi
+  if [ "$TERHM_PROJECT_CONTEXT" = 1 ]; then project_context; fi
+  session_context
+  if [ "$TERHM_TOOLS_CONTEXT" = 1 ]; then tools_context; fi
   if [ -n "${TERHM_LAST_STATUS:-}" ] && [ "$TERHM_LAST_STATUS" != "0" ]; then
     printf 'last exit code: %s\n' "$TERHM_LAST_STATUS"
   fi
@@ -67,13 +322,21 @@ build_context() {
   printf 'files: %s\n' "$(list_files)"
 }
 
-# Cleans the model output: first line only, no backticks or leading "$ ".
+# Cleans the model output: no <think> block, no ``` fence lines, first non-empty
+# line only, no surrounding backticks or leading "$ ".
 clean_output() {
-  local s="$1"
+  local s="$1" line found=0
   s="${s//$'\r'/}"
-  s="${s%%$'\n'*}"
-  s="${s#"${s%%[![:space:]]*}"}"
-  s="${s%"${s##*[![:space:]]}"}"
+  # a thinking block (if the model or template still produced one)
+  if [[ $s == *"</think>"* ]]; then s="${s##*</think>}"; fi
+  s="${s#<think>}"
+  while IFS= read -r line; do
+    line="${line#"${line%%[![:space:]]*}"}"
+    line="${line%"${line##*[![:space:]]}"}"
+    case "$line" in ""|'```'*) continue ;; esac
+    s="$line"; found=1; break
+  done <<< "$s"
+  [ "$found" = 1 ] || s=""   # only blank or fence lines
   while [[ $s == \`* ]]; do s="${s#\`}"; done
   while [[ $s == *\` ]]; do s="${s%\`}"; done
   s="${s#"${s%%[![:space:]]*}"}"
@@ -132,9 +395,11 @@ system_prompt() {
 generate() {
   local msgs="$1" temp="$2" payload resp out
   payload=$(jq -n --arg sys "$(system_prompt)" --argjson m "$msgs" --argjson n "$TERHM_N_PREDICT" \
-    --argjson t "$temp" --argjson rp "$TERHM_REPEAT_PENALTY" \
+    --argjson t "$temp" --argjson rp "$TERHM_REPEAT_PENALTY" --argjson tk "$TERHM_TOP_K" \
+    --argjson tp "$TERHM_TOP_P" --argjson stop "$STOP_JSON" --argjson nothink "$TERHM_NO_THINK" \
     '{messages:([{role:"system", content:$sys}] + $m), max_tokens:$n, temperature:$t,
-      repeat_penalty:$rp, repeat_last_n:64, top_k:40, top_p:0.9, cache_prompt:true, stop:["\n"]}') \
+      repeat_penalty:$rp, repeat_last_n:64, top_k:$tk, top_p:$tp, cache_prompt:true, stop:$stop}
+     + (if $nothink == 1 then {chat_template_kwargs:{enable_thinking:false}} else {} end)') \
     || { err "jq not available or payload error"; return 2; }
   if ! resp=$(curl -sS --max-time "$TERHM_TIMEOUT" -H 'Content-Type: application/json' \
       -d "$payload" "$BASE_URL/v1/chat/completions" 2>&1); then
@@ -221,6 +486,9 @@ cmd_fix() {
   printf '%s\n' "$out"
 }
 
+# Prints the context that would be sent with a request from the current directory.
+cmd_context() { build_context; }
+
 cmd_danger() {
   printf '%s' "$1" | grep -Eq -- "$TERHM_DANGEROUS"
 }
@@ -234,6 +502,7 @@ cmd_doctor() {
   for c in curl jq grep; do
     if command -v "$c" >/dev/null 2>&1; then printf '[ok]   %s\n' "$c"; else printf '[FAIL] missing: %s\n' "$c"; ok=1; fi
   done
+  printf '[info] model profile: %s\n' "$TERHM_MODEL"
   if find_prompt >/dev/null; then
     printf '[ok]   prompt: %s\n' "$(find_prompt)"
   else
@@ -258,6 +527,7 @@ terhm $TERHM_VERSION
   terhm fix [--status N] [--request "request"] -- "command"
                             propose a fix for a failed command
   terhm danger "command"    exit 0 if the command looks dangerous
+  terhm context             print the context sent to the model from this directory
   terhm status              exit 0 if the server is up
   terhm doctor              check the installation
 Config: $CONFIG_FILE
@@ -268,6 +538,7 @@ case "${1:-help}" in
   ask) shift; cmd_ask "$@" ;;
   fix) shift; cmd_fix "$@" ;;
   danger) shift; if [ "${1:-}" = "--" ]; then shift; fi; cmd_danger "${1:-}" ;;
+  context) cmd_context ;;
   status) cmd_status ;;
   doctor) cmd_doctor ;;
   version|--version|-v) echo "terhm $TERHM_VERSION" ;;
