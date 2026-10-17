@@ -1,0 +1,276 @@
+#!/usr/bin/env bash
+# terhm - turns natural language into shell commands with a local model (nl2sh-1.5b).
+# Usage: terhm ask "text" | terhm fix "command" | terhm danger "command" | terhm doctor | terhm status
+set -uo pipefail
+
+TERHM_VERSION="0.2.0"
+CONFIG_FILE="${TERHM_CONFIG:-${XDG_CONFIG_HOME:-$HOME/.config}/terhm/config}"
+# shellcheck disable=SC1090
+[ -f "$CONFIG_FILE" ] && . "$CONFIG_FILE"
+
+: "${TERHM_HOST:=127.0.0.1}"
+: "${TERHM_PORT:=11500}"
+: "${TERHM_TIMEOUT:=20}"
+: "${TERHM_FILES:=40}"
+: "${TERHM_N_PREDICT:=64}"
+: "${TERHM_TEMPERATURE:=0}"
+: "${TERHM_REPEAT_PENALTY:=1.08}"
+: "${TERHM_RETRIES:=2}"          # extra attempts when the proposed command fails the check
+
+DEFAULT_DANGEROUS='(^|[;&|[:space:]])(sudo|su|doas|dd|mkfs[.a-z0-9]*|shred|wipefs|fdisk|parted)([[:space:]]|$)|rm[[:space:]]+(-[a-zA-Z]*[rf][a-zA-Z]*|--recursive|--force)|(chmod|chown)[[:space:]]+-[a-zA-Z]*R|>[[:space:]]*/dev/(sd|nvme|vd)|(curl|wget)[^|]*\|[[:space:]]*(sudo[[:space:]]+)?(ba|z)?sh|:\(\)[[:space:]]*\{'
+: "${TERHM_DANGEROUS:=$DEFAULT_DANGEROUS}"
+
+SELF="$(readlink -f "${BASH_SOURCE[0]}")"
+SELF_DIR="$(dirname "$SELF")"
+TERHM_HOME="${TERHM_HOME:-${XDG_DATA_HOME:-$HOME/.local/share}/terhm}"
+BASE_URL="http://${TERHM_HOST}:${TERHM_PORT}"
+
+err() { printf 'terhm: %s\n' "$*" >&2; }
+
+find_prompt() {
+  local p
+  for p in "$TERHM_HOME/prompts/system.txt" "$SELF_DIR/../prompts/system.txt"; do
+    if [ -r "$p" ]; then printf '%s' "$p"; return 0; fi
+  done
+  return 1
+}
+
+# Listing for the context: directories first (with /), then files, hidden ones last,
+# so in a home full of dotfiles the model still sees Downloads/, Documents/...
+list_files() {
+  local f dirs=() plain=() hidden=() out=()
+  shopt -s nullglob
+  for f in *; do if [ -d "$f" ]; then dirs+=("$f/"); else plain+=("$f"); fi; done
+  for f in .[!.]* ..?*; do if [ -d "$f" ]; then hidden+=("$f/"); else hidden+=("$f"); fi; done
+  for f in "${dirs[@]}" "${plain[@]}" "${hidden[@]}"; do
+    if [[ $f == *[[:space:]]* ]]; then f="'$f'"; fi
+    out+=("$f")
+    [ "${#out[@]}" -ge "$TERHM_FILES" ] && break
+  done
+  [ "${#out[@]}" -gt 0 ] && printf '%s ' "${out[@]}"
+}
+
+build_context() {
+  local branch="" hist
+  if command -v git >/dev/null 2>&1; then
+    branch=$(git symbolic-ref --short -q HEAD 2>/dev/null || true)
+  fi
+  printf 'cwd: %s\n' "$PWD"
+  if [ -n "$branch" ]; then printf 'git branch: %s\n' "$branch"; fi
+  if [ -n "${TERHM_LAST_STATUS:-}" ] && [ "$TERHM_LAST_STATUS" != "0" ]; then
+    printf 'last exit code: %s\n' "$TERHM_LAST_STATUS"
+  fi
+  if [ -n "${TERHM_HISTORY:-}" ]; then
+    hist="${TERHM_HISTORY//$'\n'/; }"
+    printf 'recent commands: %s\n' "$hist"
+  fi
+  printf 'files: %s\n' "$(list_files)"
+}
+
+# Cleans the model output: first line only, no backticks or leading "$ ".
+clean_output() {
+  local s="$1"
+  s="${s//$'\r'/}"
+  s="${s%%$'\n'*}"
+  s="${s#"${s%%[![:space:]]*}"}"
+  s="${s%"${s##*[![:space:]]}"}"
+  while [[ $s == \`* ]]; do s="${s#\`}"; done
+  while [[ $s == *\` ]]; do s="${s%\`}"; done
+  s="${s#"${s%%[![:space:]]*}"}"
+  case "$s" in '$ '*) s="${s#\$ }" ;; esac
+  printf '%s' "$s"
+}
+
+# Checks the command WITHOUT running it: syntax (with the user's shell "-n") and
+# programs that are not installed. Prints the problems found (empty = none).
+check_command() {
+  local cmd="$1" sh="${TERHM_SHELL:-bash}" seg w i problems="" msg
+  local -a words
+  case "$sh" in bash|zsh|fish|sh|dash|ksh) ;; *) sh=bash ;; esac
+  command -v "$sh" >/dev/null 2>&1 || sh=bash
+  if ! msg=$(printf '%s\n' "$cmd" | "$sh" -n 2>&1); then
+    msg="${msg//$'\n'/ }"
+    problems="syntax error (${msg:0:160}). "
+  fi
+  while IFS= read -r seg; do
+    IFS=' ' read -r -a words <<< "$seg"
+    i=0
+    while [ "$i" -lt "${#words[@]}" ]; do
+      case "${words[$i]}" in sudo|env|nohup|time|command|exec|-*|*=*|\(|\{|!) i=$((i + 1)) ;; *) break ;; esac
+    done
+    w="${words[$i]:-}"
+    w="${w%%[\)\`]*}"
+    case "$w" in ""|*[\$\`\'\"\(\)\{\}\[\]\<\>]*) continue ;; esac
+    if ! command -v -- "$w" >/dev/null 2>&1 && ! [[ " ${TERHM_KNOWN:-} " == *" $w "* ]]; then
+      problems="$problems'$w' is not installed. "
+    fi
+  done < <(printf '%s\n' "$cmd" | sed -E 's/\|\||&&|[|;]|\$\(|`/\n/g')
+  printf '%s' "$problems"
+}
+
+# System prompt: fixed instructions (identical across requests, so the llama.cpp
+# prompt cache holds) followed by the context of the current directory.
+system_prompt() {
+  local os="" pkg="" p h
+  if [ -r /etc/os-release ]; then
+    # shellcheck disable=SC1091
+    os=$(. /etc/os-release; printf '%s' "${PRETTY_NAME:-}")
+  fi
+  for p in apt dnf pacman zypper apk brew; do
+    if command -v "$p" >/dev/null 2>&1; then pkg="$p"; break; fi
+  done
+  h=$(cat "$PROMPT_FILE")
+  h="${h//\{\{OS\}\}/${os:-$(uname -s)}}"
+  h="${h//\{\{ARCH\}\}/$(uname -m)}"
+  h="${h//\{\{SHELL\}\}/${TERHM_SHELL:-${SHELL##*/}}}"
+  h="${h//\{\{PKG\}\}/${pkg:-unknown}}"
+  printf '%s\n\n%s' "$h" "$(build_context)"
+}
+
+# One request to the model. $1 = chat messages (JSON array, without the system
+# prompt), $2 = temperature. Prints the cleaned command.
+generate() {
+  local msgs="$1" temp="$2" payload resp out
+  payload=$(jq -n --arg sys "$(system_prompt)" --argjson m "$msgs" --argjson n "$TERHM_N_PREDICT" \
+    --argjson t "$temp" --argjson rp "$TERHM_REPEAT_PENALTY" \
+    '{messages:([{role:"system", content:$sys}] + $m), max_tokens:$n, temperature:$t,
+      repeat_penalty:$rp, repeat_last_n:64, top_k:40, top_p:0.9, cache_prompt:true, stop:["\n"]}') \
+    || { err "jq not available or payload error"; return 2; }
+  if ! resp=$(curl -sS --max-time "$TERHM_TIMEOUT" -H 'Content-Type: application/json' \
+      -d "$payload" "$BASE_URL/v1/chat/completions" 2>&1); then
+    err "server unreachable at $BASE_URL (run: terhm doctor)"
+    return 1
+  fi
+  out=$(printf '%s' "$resp" | jq -r '.choices[0].message.content // empty' 2>/dev/null)
+  clean_output "$out"
+}
+
+# Appends a turn to the conversation: $1 = messages, $2 = role, $3 = text.
+add_msg() { jq -c --arg r "$2" --arg c "$3" '. + [{role:$r, content:$c}]' <<< "$1"; }
+
+# Generate and check: if the command fails the checks, send the problems back to the
+# model, up to TERHM_RETRIES times. Prints the first valid command (or the last one).
+propose() { # messages, temperature
+  local msgs="$1" temp="$2" out problems n=0
+  out=$(generate "$msgs" "$temp") || return $?
+  while [ -n "$out" ] && [ "${TERHM_CHECK:-1}" = "1" ] && [ "$n" -lt "$TERHM_RETRIES" ]; do
+    problems=$(check_command "$out")
+    [ -z "$problems" ] && break
+    n=$((n + 1))
+    msgs=$(add_msg "$msgs" assistant "$out")
+    msgs=$(add_msg "$msgs" user "That command does not work here: ${problems}Reply with a different single command that works on this system.")
+    out=$(generate "$msgs" "$temp") || return $?
+  done
+  if [ -z "$out" ]; then err "the model produced no command"; return 1; fi
+  printf '%s\n' "$out"
+}
+
+cmd_ask() {
+  local req="$*" msgs temp="$TERHM_TEMPERATURE"
+  if [ -z "$req" ] && [ ! -t 0 ]; then req=$(cat); fi
+  if [ -z "${req//[[:space:]]/}" ]; then err "empty request"; return 2; fi
+  PROMPT_FILE=$(find_prompt) || { err "prompts/system.txt not found (TERHM_HOME=$TERHM_HOME)"; return 2; }
+  msgs=$(add_msg '[]' user "$req")
+  if [ "${TERHM_ALT:-0}" = "1" ]; then
+    temp="0.7"
+    # alternative: explicitly ask for a command different from the one already proposed
+    if [ -n "${TERHM_PREV:-}" ]; then
+      msgs=$(add_msg "$msgs" assistant "$TERHM_PREV")
+      msgs=$(add_msg "$msgs" user "Give a different command for the same request.")
+    fi
+  fi
+  propose "$msgs" "$temp"
+}
+
+# Fix for a command that failed when it was run.
+# terhm fix [--status N] [--request "original request"] [--] "command"
+cmd_fix() {
+  local st="" orig="" cmd msgs why out
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --status) st="${2:-}"; shift 2 ;;
+      --request) orig="${2:-}"; shift 2 ;;
+      --) shift; break ;;
+      *) break ;;
+    esac
+  done
+  cmd="$*"
+  if [ -z "${cmd//[[:space:]]/}" ]; then err "no command to fix"; return 2; fi
+  PROMPT_FILE=$(find_prompt) || { err "prompts/system.txt not found (TERHM_HOME=$TERHM_HOME)"; return 2; }
+  why="it failed"
+  [ -n "$st" ] && why="it failed with exit code $st"
+  case "$st" in
+    127) why="$why (command not found)" ;;
+    126) why="$why (permission denied or not executable)" ;;
+  esac
+  if [ -n "${TERHM_ERROR:-}" ]; then why="$why: ${TERHM_ERROR:0:300}"; fi
+  if [ -n "$orig" ]; then
+    msgs=$(add_msg '[]' user "$orig")
+    msgs=$(add_msg "$msgs" assistant "$cmd")
+    msgs=$(add_msg "$msgs" user "I ran it and $why. Reply with a corrected single command.")
+  else
+    msgs=$(add_msg '[]' user "Fix this command, $why: $cmd")
+  fi
+  out=$(propose "$msgs" "$TERHM_TEMPERATURE") || return $?
+  # same command as before: ask for something different, with more randomness
+  if [ "$out" = "$cmd" ]; then
+    msgs=$(add_msg "$msgs" assistant "$out")
+    msgs=$(add_msg "$msgs" user "That is the same command that failed. Give a different one.")
+    out=$(propose "$msgs" 0.7) || return $?
+  fi
+  printf '%s\n' "$out"
+}
+
+cmd_danger() {
+  printf '%s' "$1" | grep -Eq -- "$TERHM_DANGEROUS"
+}
+
+cmd_status() {
+  curl -fsS --max-time 3 "$BASE_URL/health" >/dev/null 2>&1 || return 1
+}
+
+cmd_doctor() {
+  local ok=0 c
+  for c in curl jq grep; do
+    if command -v "$c" >/dev/null 2>&1; then printf '[ok]   %s\n' "$c"; else printf '[FAIL] missing: %s\n' "$c"; ok=1; fi
+  done
+  if find_prompt >/dev/null; then
+    printf '[ok]   prompt: %s\n' "$(find_prompt)"
+  else
+    printf '[FAIL] prompts/system.txt not found\n'; ok=1
+  fi
+  if command -v systemctl >/dev/null 2>&1; then
+    printf '[info] service: %s\n' "$(systemctl --user is-active terhm.service 2>&1)"
+  fi
+  if cmd_status; then
+    printf '[ok]   server responding at %s\n' "$BASE_URL"
+  else
+    printf '[FAIL] server not responding at %s\n       try: systemctl --user status terhm ; journalctl --user -u terhm -e\n' "$BASE_URL"
+    ok=1
+  fi
+  return $ok
+}
+
+usage() {
+  cat <<USAGE
+terhm $TERHM_VERSION
+  terhm ask "request"       print the proposed command (never runs it)
+  terhm fix [--status N] [--request "request"] -- "command"
+                            propose a fix for a failed command
+  terhm danger "command"    exit 0 if the command looks dangerous
+  terhm status              exit 0 if the server is up
+  terhm doctor              check the installation
+Config: $CONFIG_FILE
+USAGE
+}
+
+case "${1:-help}" in
+  ask) shift; cmd_ask "$@" ;;
+  fix) shift; cmd_fix "$@" ;;
+  danger) shift; if [ "${1:-}" = "--" ]; then shift; fi; cmd_danger "${1:-}" ;;
+  status) cmd_status ;;
+  doctor) cmd_doctor ;;
+  version|--version|-v) echo "terhm $TERHM_VERSION" ;;
+  help|--help|-h) usage ;;
+  *) usage >&2; exit 2 ;;
+esac

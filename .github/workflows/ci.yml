@@ -1,0 +1,15 @@
+name: ci
+on: [push, pull_request]
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Dependencies
+        run: sudo apt-get update && sudo apt-get install -y shellcheck jq zsh fish
+      - name: ShellCheck
+        run: shellcheck -S warning bin/terhm install.sh uninstall.sh shell/terhm.bash tests/run.sh
+      - name: zsh/fish syntax
+        run: zsh -n shell/terhm.zsh && fish -n shell/terhm.fish
+      - name: Tests
+        run: bash tests/run.sh
