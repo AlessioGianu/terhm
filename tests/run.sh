@@ -21,7 +21,9 @@ log() { jq -r "$@" < "$MOCK_LOG"; }
 sys_prompt() { log '.messages[0].content'; }
 
 check "simple ask" "find . -type f -size +100M -exec ls -lh {} +" "$("$TERHM" ask "find files bigger than 100MB")"
-check "strips fence" "bash" "$("$TERHM" ask "fence")"
+"$TERHM" ask "fence" >/dev/null 2>&1; check "fence line only -> no command" "1" "$?"
+check "command inside a fenced block" "ls -la" "$("$TERHM" ask "multifence")"
+check "strips think block" "git status" "$("$TERHM" ask "think")"
 check "strips backticks" "ls -la" "$("$TERHM" ask "wrapped")"
 check "strips leading \$" "ls -la" "$("$TERHM" ask "dollar")"
 
@@ -47,6 +49,44 @@ T=$(mktemp -d); mkdir -p "$T/Downloads" "$T/.hidden"; touch "$T/.a" "$T/z.txt"
 (cd "$T" && "$TERHM" ask "hello" >/dev/null)
 sys_prompt | grep -qF "files: Downloads/ z.txt .a .hidden/"; check "context: directories, files, hidden" "0" "$?"
 rm -rf "$T"
+
+# project and session context
+T=$(mktemp -d)
+mkdir -p "$T/ws/src/bot/bot" "$T/ws/src/bot/launch" "$T/ws/install" "$T/app/.venv/bin"
+touch "$T/ws/install/setup.bash" "$T/ws/src/bot/launch/bringup.launch.py" "$T/app/.venv/bin/activate" "$T/app/uv.lock" "$T/app/pyproject.toml"
+printf '<package><name>bot</name><export><build_type>ament_python</build_type></export></package>\n' > "$T/ws/src/bot/package.xml"
+printf "entry_points={'console_scripts': ['talker = bot.talker:main']}\n" > "$T/ws/src/bot/setup.py"
+printf '.PHONY: build\nbuild: deps\n\tcc x.c\ntest:\n\t./t\nVAR := 1\n' > "$T/ws/Makefile"
+printf 'services:\n  db:\n    image: postgres\n  web:\n    build: .\nvolumes:\n  data:\n' > "$T/ws/compose.yaml"
+printf '{"scripts":{"dev":"vite"}}' > "$T/ws/package.json"; touch "$T/ws/pnpm-lock.yaml"
+(cd "$T/ws" && ROS_DISTRO=jazzy "$TERHM" ask "hello" >/dev/null)
+for needle in "make: Makefile, targets: build test" "docker compose: compose.yaml, services: db web" \
+              "package manager pnpm, scripts: dev" "packages: bot (ament_python: talker)" \
+              "built (install/setup.bash exists), not sourced" "ros2 launch files: bringup.launch.py" \
+              "ROS 2 jazzy sourced"; do
+  sys_prompt | grep -qF -- "$needle"; check "project context: $needle" "0" "$?"
+done
+(cd "$T/ws/src/bot/bot" && "$TERHM" context) | grep -qF "ros2 package: bot (ament_python) in .., executables: talker"
+check "ros2 package from a subdirectory" "0" "$?"
+(cd "$T/app" && VIRTUAL_ENV="$T/app/.venv" "$TERHM" context) | grep -qF "tool uv, virtualenv .venv/"
+check "python project with uv and virtualenv" "0" "$?"
+(cd "$T/app" && VIRTUAL_ENV="$T/app/.venv" "$TERHM" context) | grep -qF "python virtualenv active"
+check "active virtualenv in the session" "0" "$?"
+(cd "$T/ws" && TERHM_PROJECT_CONTEXT=0 TERHM_TOOLS_CONTEXT=0 "$TERHM" context) | grep -qE "^(make|installed tools):"
+check "project and tools context can be turned off" "1" "$?"
+rm -rf "$T"
+"$TERHM" context | grep -q "^installed tools: .*git\|^installed tools: .*jq"; check "installed tools listed" "0" "$?"
+
+# model profiles
+"$TERHM" ask "hello" >/dev/null
+check "nl2sh: no thinking flag" "null" "$(log -c .chat_template_kwargs)"
+TERHM_MODEL=qwen3.5-4b "$TERHM" ask "hello" >/dev/null
+check "qwen: thinking off" "false" "$(log .chat_template_kwargs.enable_thinking)"
+check "qwen: stops at fence end or blank line" '["\n```","\n\n"]' "$(log -c .stop)"
+check "qwen: top_k 20" "20" "$(log .top_k)"
+check "qwen: no repeat penalty" "1.0" "$(log .repeat_penalty)"
+check "qwen: longer output" "160" "$(log .max_tokens)"
+check "qwen: config override" "0.5" "$(TERHM_MODEL=qwen3.5-4b TERHM_TOP_P=0.5 "$TERHM" ask hello >/dev/null; log .top_p)"
 
 # no hand-written hints in the prompt
 sys_prompt | grep -q "hint:"; check "no fixed hints in the prompt" "1" "$?"

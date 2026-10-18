@@ -1,11 +1,11 @@
 [Unit]
-Description=terhm - local nl2sh-1.5b model (llama-server)
+Description=terhm - local @MODEL_NAME@ model (llama-server)
 After=network.target
 
 [Service]
 Type=simple
 Environment=LD_LIBRARY_PATH=@LLAMA_LIBDIR@
-ExecStart=@LLAMA_SERVER@ -m @MODEL@ --host 127.0.0.1 --port @PORT@ -c 4096 -np 1 -t @THREADS@
+ExecStart=@LLAMA_SERVER@ -m @MODEL@ --host 127.0.0.1 --port @PORT@ -c 4096 -np 1 -t @THREADS@ @EXTRA@
 Restart=on-failure
 RestartSec=3
 Nice=5
