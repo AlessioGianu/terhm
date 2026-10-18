@@ -47,7 +47,20 @@ The `terhm ›` prompt is bash-only for now; in zsh and fish `Ctrl+G` on an empt
 
 If the command looks dangerous (`rm -rf`, `sudo`, `dd`, `mkfs`, `curl | sh`…) a warning is shown.
 
-Commands: `terhm ask "..."`, `terhm fix --status N -- "command"`, `terhm context` (shows what is sent to the model from the current directory), `terhm doctor`, `terhm status`.
+Commands: `terhm ask "..."`, `terhm fix --status N -- "command"`, `terhm context` (shows what is sent to the model from the current directory), `terhm doctor`, `terhm status`, `terhm ssh host` (see below).
+
+## Over SSH
+
+```bash
+terhm ssh user@server          # same arguments as ssh
+```
+
+Opens a normal SSH session with Ctrl+G working on the remote host. The model keeps running on **your** machine: terhm adds a reverse tunnel (`ssh -R`) so the remote can reach it, and sends a small bundle (the `terhm` script, the prompt and the shell plugins, ~30 KB) inside the ssh command. It is unpacked in `~/.cache/terhm/ssh/` on the remote, and your usual login shell (bash, zsh or fish) starts with your own config plus the plugin. Nothing is installed on the remote and no model is downloaded there; the context (directory, project, installed tools) is the remote's.
+
+- The remote needs `bash`, `curl` and `jq`, and must allow port forwarding (`AllowTcpForwarding`, on by default). If something is missing, you get a normal shell and a message saying why.
+- With a remote command (`terhm ssh host uptime`) or `-N`/`-T`/`-W`, it is just `ssh`.
+- To always use it: `alias ssh='terhm ssh'`.
+- It nests: `terhm ssh` from inside a `terhm ssh` session forwards the tunnel one more hop.
 
 ## Configuration
 

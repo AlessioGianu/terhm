@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # terhm - turns natural language into shell commands with a local model (nl2sh-1.5b or Qwen3.5-4B).
-# Usage: terhm ask "text" | terhm fix "command" | terhm danger "command" | terhm context | terhm doctor | terhm status
+# Usage: terhm ask "text" | terhm fix "command" | terhm danger "command" | terhm context | terhm doctor | terhm status | terhm ssh host
 set -uo pipefail
 
 TERHM_VERSION="0.3.0"
@@ -508,7 +508,9 @@ cmd_doctor() {
   else
     printf '[FAIL] prompts/system.txt not found\n'; ok=1
   fi
-  if command -v systemctl >/dev/null 2>&1; then
+  if [ -n "${TERHM_SSH_PORT:-}" ]; then
+    printf '[info] ssh session: the model runs on your local machine, reached through the tunnel\n'
+  elif command -v systemctl >/dev/null 2>&1; then
     printf '[info] service: %s\n' "$(systemctl --user is-active terhm.service 2>&1)"
   fi
   if cmd_status; then
@@ -518,6 +520,152 @@ cmd_doctor() {
     ok=1
   fi
   return $ok
+}
+
+# --- ssh sessions -----------------------------------------------------------
+# "terhm ssh host" = ssh with Ctrl+G on the remote host. The model keeps running here:
+# a reverse tunnel (ssh -R) lets the remote reach it, and a small bundle (this script,
+# the prompt, the shell plugins) is sent inside the ssh command and unpacked in
+# ~/.cache/terhm/ssh/ on the remote. Context (cwd, files, tools) comes from the remote.
+# Needs bash, curl and jq on the remote; nothing is installed there permanently.
+
+find_shell_dir() {
+  local p
+  for p in "$TERHM_HOME/shell" "$SELF_DIR/../shell"; do
+    if [ -r "$p/terhm.bash" ]; then printf '%s' "$p"; return 0; fi
+  done
+  return 1
+}
+
+# Startup files that load the user's own config, then the plugin.
+ssh_write_rcfiles() { # $1 = bundle directory
+  local d="$1" f
+  mkdir -p "$d/zsh"
+  # bash: same files as a login shell (what plain ssh would run), then the plugin
+  cat > "$d/bashrc" <<'EOF'
+[ -f /etc/profile ] && . /etc/profile
+if [ -f ~/.bash_profile ]; then . ~/.bash_profile
+elif [ -f ~/.bash_login ]; then . ~/.bash_login
+elif [ -f ~/.profile ]; then . ~/.profile
+fi
+PATH="$TERHM_HOME/bin:$PATH"
+. "$TERHM_HOME/shell/terhm.bash"
+EOF
+  # zsh: ZDOTDIR points here; each file sources the user's one from their ZDOTDIR
+  for f in .zshenv .zprofile .zshrc .zlogin; do
+    cat > "$d/zsh/$f" <<EOF
+_terhm_zd=\$ZDOTDIR; ZDOTDIR=\$TERHM_ZDOTDIR
+[[ -f \$ZDOTDIR/$f ]] && . \$ZDOTDIR/$f
+TERHM_ZDOTDIR=\$ZDOTDIR; ZDOTDIR=\$_terhm_zd; unset _terhm_zd
+EOF
+  done
+  cat >> "$d/zsh/.zshrc" <<'EOF'
+path=("$TERHM_HOME/bin" $path)
+. "$TERHM_HOME/shell/terhm.zsh"
+EOF
+  cat >> "$d/zsh/.zlogin" <<'EOF'
+if [[ $TERHM_ZDOTDIR == "$HOME" ]]; then unset ZDOTDIR; else export ZDOTDIR=$TERHM_ZDOTDIR; fi
+unset TERHM_ZDOTDIR
+EOF
+}
+
+# Script run by the remote sh: unpack the bundle, check the tunnel, start the shell.
+ssh_bootstrap() { # $1 = bundle id, $2 = remote port, $3 = bundle (tar.gz, base64)
+  cat <<EOF
+base="\${XDG_CACHE_HOME:-\$HOME/.cache}/terhm/ssh"
+d="\$base/$1"
+missing=""
+for c in bash curl jq tar gzip base64; do command -v "\$c" >/dev/null 2>&1 || missing="\$missing \$c"; done
+if [ -n "\$missing" ]; then
+  printf 'terhm: missing on this host:%s. Ctrl+G is not available in this session.\n' "\$missing" >&2
+  exec "\${SHELL:-/bin/sh}" -l
+fi
+if [ ! -f "\$d/.ok" ]; then
+  if ! mkdir -p "\$d" 2>/dev/null || [ ! -w "\$d" ]; then
+    d=\$(mktemp -d "\${TMPDIR:-/tmp}/terhm-ssh.XXXXXX")
+  fi
+  base64 -d <<'TERHM_BUNDLE' | tar xzf - -C "\$d" && touch "\$d/.ok"
+$3
+TERHM_BUNDLE
+  # bundles of older terhm versions
+  find "\$base" -mindepth 1 -maxdepth 1 -type d ! -name "$1" -mtime +30 -exec rm -rf {} + 2>/dev/null
+fi
+export TERHM_HOME="\$d" TERHM_CONFIG="\$d/config" TERHM_SSH_PORT=$2
+if curl -fsS --max-time 3 "http://127.0.0.1:$2/health" >/dev/null 2>&1; then
+  printf '\033[2mterhm: Ctrl+G uses the model on your local machine\033[0m\n' >&2
+else
+  printf 'terhm: cannot reach your local model through the tunnel (model not running locally, or port forwarding disabled on this server: AllowTcpForwarding)\n' >&2
+fi
+sh_path="\${SHELL:-/bin/sh}"
+case "\${sh_path##*/}" in
+  bash) exec "\$sh_path" --rcfile "\$d/bashrc" -i ;;
+  zsh) export TERHM_ZDOTDIR="\${ZDOTDIR:-\$HOME}" ZDOTDIR="\$d/zsh"; exec "\$sh_path" -l ;;
+  fish) exec "\$sh_path" -l -C "set -gx PATH '\$d/bin' \\\$PATH; source '\$d/shell/terhm.fish'" ;;
+  *) printf 'terhm: %s is not supported, starting bash\n' "\$sh_path" >&2
+     exec bash --rcfile "\$d/bashrc" -i ;;
+esac
+EOF
+}
+
+# ssh options that take an argument (from ssh(1))
+SSH_ARG_OPTS="BbcDEeFIiJLlmOoPpQRSWw"
+
+cmd_ssh() {
+  local -a opts=() rest
+  local a i ch passthru=0 host prompt shdir tmp id rport bundle script
+  local orig=("$@")
+  while [ $# -gt 0 ]; do
+    a="$1"
+    case "$a" in
+      --) shift; break ;;
+      -?*)
+        opts+=("$a"); shift
+        # option cluster like -vp: the first option that takes an argument ends it
+        i=1
+        while [ "$i" -lt "${#a}" ]; do
+          ch="${a:$i:1}"
+          case "$ch" in N|T|W|O|G|Q|V) passthru=1 ;; esac   # no interactive shell: plain ssh
+          if [[ $SSH_ARG_OPTS == *"$ch"* ]]; then
+            if [ "$i" -eq $(( ${#a} - 1 )) ] && [ $# -gt 0 ]; then opts+=("$1"); shift; fi
+            break
+          fi
+          i=$((i + 1))
+        done ;;
+      *) break ;;
+    esac
+  done
+  local ssh_bin="${TERHM_SSH_BIN:-ssh}"
+  if [ $# -eq 0 ]; then exec "$ssh_bin" "${orig[@]}"; fi
+  host="$1"; shift; rest=("$@")
+  # a remote command or a non-interactive mode: nothing to add
+  if [ "${#rest[@]}" -gt 0 ] || [ "$passthru" = 1 ]; then exec "$ssh_bin" "${orig[@]}"; fi
+
+  prompt=$(find_prompt) || { err "prompts/system.txt not found (TERHM_HOME=$TERHM_HOME)"; return 2; }
+  shdir=$(find_shell_dir) || { err "shell plugins not found (TERHM_HOME=$TERHM_HOME)"; return 2; }
+  cmd_status || err "warning: the local model is not responding at $BASE_URL (Ctrl+G will fail until it is up)"
+
+  tmp=$(mktemp -d "${TMPDIR:-/tmp}/terhm-ssh.XXXXXX") || return 1
+  mkdir -p "$tmp/bin" "$tmp/prompts" "$tmp/shell"
+  cp "$SELF" "$tmp/bin/terhm"; chmod 755 "$tmp/bin/terhm"
+  cp "$prompt" "$tmp/prompts/system.txt"
+  cp "$shdir"/terhm.bash "$shdir"/terhm.zsh "$shdir"/terhm.fish "$tmp/shell/"
+  # local settings (model profile, sampling, dangerous regex...), then the tunnel
+  { [ -f "$CONFIG_FILE" ] && grep -v '# terhm ssh$' "$CONFIG_FILE"
+    printf 'TERHM_MODEL=%q # terhm ssh\n' "$TERHM_MODEL"
+    printf 'TERHM_HOST=127.0.0.1 # terhm ssh\n'
+    printf 'TERHM_PORT="$TERHM_SSH_PORT" # terhm ssh\n'
+  } > "$tmp/config"
+  ssh_write_rcfiles "$tmp"
+  id="$TERHM_VERSION-$(cd "$tmp" && find . -type f | LC_ALL=C sort | xargs cat | sha256sum | cut -c1-12)"
+  bundle=$(tar czf - -C "$tmp" --owner=0 --group=0 . | base64 -w0)
+  rm -rf "$tmp"
+
+  rport="${TERHM_SSH_REMOTE_PORT:-$((20000 + RANDOM % 40000))}"
+  script=$(ssh_bootstrap "$id" "$rport" "$bundle" | base64 -w0)
+  # Works whatever the remote login shell is (bash, zsh, fish, tcsh): only plain
+  # words and one single-quoted string.
+  exec "$ssh_bin" -t -R "$rport:$TERHM_HOST:$TERHM_PORT" "${opts[@]}" "$host" \
+    "exec sh -c 'eval \"\$(echo $script | base64 -d)\"'"
 }
 
 usage() {
@@ -530,6 +678,8 @@ terhm $TERHM_VERSION
   terhm context             print the context sent to the model from this directory
   terhm status              exit 0 if the server is up
   terhm doctor              check the installation
+  terhm ssh [ssh options] host
+                            ssh with Ctrl+G on the remote host, using the local model
 Config: $CONFIG_FILE
 USAGE
 }
@@ -541,6 +691,7 @@ case "${1:-help}" in
   context) cmd_context ;;
   status) cmd_status ;;
   doctor) cmd_doctor ;;
+  ssh) shift; cmd_ssh "$@" ;;
   version|--version|-v) echo "terhm $TERHM_VERSION" ;;
   help|--help|-h) usage ;;
   *) usage >&2; exit 2 ;;

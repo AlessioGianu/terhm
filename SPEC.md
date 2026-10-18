@@ -52,6 +52,7 @@
 | F8 | `Esc` or `Ctrl+C` restore the original natural-language text. |
 | F9 | The service starts automatically at boot (even without a graphical login). |
 | F10 | If the daemon does not respond, the plugin shows a clear message and does not block the shell (5 s timeout). |
+| F11 | `terhm ssh host` opens an SSH session where the hotkey works on the remote host, using the local model through a reverse tunnel; nothing is installed permanently on the remote. |
 
 ## 5. Non-functional requirements
 

@@ -126,5 +126,34 @@ TERHM_PORT=1 "$TERHM" ask "hello" >/dev/null 2>&1; check "server down -> exit 1"
 "$TERHM" status; check "status ok" "0" "$?"
 TERHM_PORT=1 "$TERHM" status; check "status with server down" "1" "$?"
 
+# ssh sessions: a fake ssh records its arguments; the remote command is then run here
+T=$(mktemp -d); mkdir -p "$T/home" "$T/fakebin"
+printf '#!/bin/sh\nfor a in "$@"; do printf "%%s\\n" "$a"; done > "%s/args"\n' "$T" > "$T/ssh"
+# fake login shell named bash: records how it was started instead of opening a prompt
+printf '#!/bin/sh\necho "$@" > "%s/shell_args"; env > "%s/shell_env"\n' "$T" "$T" > "$T/fakebin/bash"
+chmod +x "$T/ssh" "$T/fakebin/bash"
+TERHM_SSH_BIN="$T/ssh" TERHM_SSH_REMOTE_PORT=$PORT "$TERHM" ssh -vp 2200 -o X=y myhost 2>/dev/null
+check "ssh: tty and reverse tunnel" "-t|-R|$PORT:127.0.0.1:$PORT" "$(head -3 "$T/args" | paste -sd'|' -)"
+check "ssh: user options kept, host last" "-vp|2200|-o|X=y|myhost" "$(sed -n 4,8p "$T/args" | paste -sd'|' -)"
+TERHM_SSH_BIN="$T/ssh" "$TERHM" ssh myhost uptime
+check "ssh: remote command -> plain ssh" "myhost|uptime" "$(paste -sd'|' - < "$T/args")"
+TERHM_SSH_BIN="$T/ssh" "$TERHM" ssh -N -L 1:a:2 myhost
+check "ssh: -N -> plain ssh" "-N|-L|1:a:2|myhost" "$(paste -sd'|' - < "$T/args")"
+TERHM_SSH_BIN="$T/ssh" TERHM_SSH_REMOTE_PORT=$PORT "$TERHM" ssh myhost 2>/dev/null
+HOME="$T/home" SHELL="$T/fakebin/bash" XDG_CACHE_HOME="" sh -c "$(tail -n1 "$T/args")" 2>"$T/remote_err"
+check "ssh remote: tunnel check ok" "0" "$(grep -qF 'uses the model on your local machine' "$T/remote_err"; echo $?)"
+check "ssh remote: bash started with the plugin rcfile" "0" "$(grep -qE -- '--rcfile .*/terhm/ssh/[^/]+/bashrc -i' "$T/shell_args"; echo $?)"
+D=$(sed -n 's/^TERHM_HOME=//p' "$T/shell_env")
+ok=1; [ -x "$D/bin/terhm" ] && [ -f "$D/shell/terhm.bash" ] && [ -f "$D/prompts/system.txt" ] && [ -f "$D/zsh/.zshrc" ] && ok=0
+check "ssh remote: bundle unpacked" "0" "$ok"
+check "ssh remote: client reaches the model through the tunnel port" "find . -type f -size +100M -exec ls -lh {} +" \
+  "$(env -i PATH="$PATH" HOME="$T/home" TERHM_HOME="$D" TERHM_CONFIG="$D/config" TERHM_SSH_PORT=$PORT MOCK_LOG="$MOCK_LOG" \
+     "$D/bin/terhm" ask "find files bigger than 100MB")"
+TERHM_SSH_BIN="$T/ssh" TERHM_SSH_REMOTE_PORT=1 "$TERHM" ssh myhost 2>/dev/null
+HOME="$T/home" SHELL="$T/fakebin/bash" XDG_CACHE_HOME="" sh -c "$(tail -n1 "$T/args")" 2>"$T/remote_err"
+check "ssh remote: tunnel down -> warning, shell still starts" "0|0" \
+  "$(grep -qF 'cannot reach your local model' "$T/remote_err"; echo $?)|$(grep -qF -- '--rcfile' "$T/shell_args"; echo $?)"
+rm -rf "$T"
+
 echo; echo "passed: $pass  failed: $fail"
 [ "$fail" -eq 0 ]
