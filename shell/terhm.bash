@@ -51,29 +51,85 @@ else
   esac
 fi
 
-# Reads a line one character at a time (read -e and canonical-mode read do not work
-# well inside bind -x). Result in REPLY; exit 1 if cancelled.
+# Redraws the request line: $1 = prompt, $2 = cursor position in REPLY.
+_terhm_draw() {
+  local w=$(( ${COLUMNS:-80} - ${#1} - 1 )) s=0 vis
+  (( w < 10 )) && w=10
+  (( $2 > w )) && s=$(( $2 - w ))                     # long line: scroll horizontally
+  vis=${REPLY:s:w}
+  printf '\r\e[K%s%s' "$1" "$vis" >&2
+  (( ${#vis} > $2 - s )) && printf '\e[%dD' $(( ${#vis} - $2 + s )) >&2
+  return 0
+}
+
+# Small line editor (read -e and canonical-mode read do not work well inside bind -x):
+# arrows, Home/End, Delete, Ctrl+A/E/B/F/D/K/U/W, Alt+B/F, bracketed paste.
+# Result in REPLY; exit 1 if cancelled (Ctrl+C, Esc).
 _terhm_read() {
-  local c rest tty
+  local c seq tty pos=0 p paste=0 ok=1 sp=$' \t'
   REPLY=""
   tty=$(stty -g </dev/tty 2>/dev/null)
   stty -icanon -echo -isig min 1 time 0 </dev/tty 2>/dev/null
   printf '%s' "$1" >&2
   while IFS= read -rsn1 c </dev/tty; do
+    if [[ $c == $'\e' ]]; then
+      # escape sequence: CSI/SS3 up to the final byte (\e[D, \e[3~, \e[200~...)
+      seq=""
+      if IFS= read -rsn1 -t 0.05 c </dev/tty; then
+        seq=$c
+        if [[ $c == '[' || $c == O ]]; then
+          while IFS= read -rsn1 -t 0.05 c </dev/tty; do
+            seq+=$c; [[ $c == [@-~] ]] && break
+          done
+        fi
+      fi
+      case $seq in
+        "") (( paste )) && continue                     # Esc alone cancels
+            printf '\n' >&2; REPLY=""; ok=0; break ;;
+        '[200~') paste=1; continue ;;
+        '[201~') paste=0 ;;
+        '[D'|OD) (( pos > 0 )) && pos=$((pos - 1)) ;;
+        '[C'|OC) (( pos < ${#REPLY} )) && pos=$((pos + 1)) ;;
+        '[H'|OH|'[1~'|'[7~') pos=0 ;;
+        '[F'|OF|'[4~'|'[8~') pos=${#REPLY} ;;
+        '[3~') REPLY=${REPLY:0:pos}${REPLY:pos+1} ;;
+        '[1;5D'|'[1;3D'|b|B)                            # word left
+          while (( pos > 0 )) && [[ $sp == *"${REPLY:pos-1:1}"* ]]; do pos=$((pos - 1)); done
+          while (( pos > 0 )) && [[ $sp != *"${REPLY:pos-1:1}"* ]]; do pos=$((pos - 1)); done ;;
+        '[1;5C'|'[1;3C'|f|F)                            # word right
+          while (( pos < ${#REPLY} )) && [[ $sp == *"${REPLY:pos:1}"* ]]; do pos=$((pos + 1)); done
+          while (( pos < ${#REPLY} )) && [[ $sp != *"${REPLY:pos:1}"* ]]; do pos=$((pos + 1)); done ;;
+        *) continue ;;                                  # up/down, F keys...: ignored
+      esac
+      _terhm_draw "$1" "$pos"; continue
+    fi
+    if (( paste )); then                                # pasted text: newlines become spaces
+      [[ $c == $'\r' || $c == $'\n' || $c == $'\t' || $c == "" ]] && c=" "
+      [[ $c == [[:cntrl:]] ]] || { REPLY=${REPLY:0:pos}$c${REPLY:pos}; pos=$((pos + 1)); }
+      continue
+    fi
     case $c in
       ""|$'\r'|$'\n') printf '\n' >&2; break ;;
-      $'\x03') printf '^C\n' >&2; REPLY=""; c=cancel; break ;;
-      $'\e')                                            # Esc alone cancels, arrows ignored
-        if IFS= read -rsn2 -t 0.05 rest </dev/tty; then continue; fi
-        printf '\n' >&2; REPLY=""; c=cancel; break ;;
-      $'\x7f'|$'\b') if [[ -n $REPLY ]]; then REPLY=${REPLY%?}; printf '\b \b' >&2; fi ;;
-      $'\x15') printf '\r\e[K%s' "$1" >&2; REPLY="" ;;   # Ctrl+U
-      [[:cntrl:]]) ;;
-      *) REPLY+=$c; printf '%s' "$c" >&2 ;;
+      $'\x03') printf '^C\n' >&2; REPLY=""; ok=0; break ;;
+      $'\x7f'|$'\b') (( pos > 0 )) && { REPLY=${REPLY:0:pos-1}${REPLY:pos}; pos=$((pos - 1)); } ;;
+      $'\x04') REPLY=${REPLY:0:pos}${REPLY:pos+1} ;;     # Ctrl+D
+      $'\x01') pos=0 ;;                                  # Ctrl+A
+      $'\x05') pos=${#REPLY} ;;                          # Ctrl+E
+      $'\x02') (( pos > 0 )) && pos=$((pos - 1)) ;;      # Ctrl+B
+      $'\x06') (( pos < ${#REPLY} )) && pos=$((pos + 1)) ;;  # Ctrl+F
+      $'\x0b') REPLY=${REPLY:0:pos} ;;                   # Ctrl+K
+      $'\x15') REPLY=${REPLY:pos}; pos=0 ;;              # Ctrl+U
+      $'\x17') p=$pos                                    # Ctrl+W
+        while (( p > 0 )) && [[ $sp == *"${REPLY:p-1:1}"* ]]; do p=$((p - 1)); done
+        while (( p > 0 )) && [[ $sp != *"${REPLY:p-1:1}"* ]]; do p=$((p - 1)); done
+        REPLY=${REPLY:0:p}${REPLY:pos}; pos=$p ;;
+      [[:cntrl:]]) continue ;;
+      *) REPLY=${REPLY:0:pos}$c${REPLY:pos}; pos=$((pos + 1)) ;;
     esac
+    _terhm_draw "$1" "$pos"
   done
   [[ -n $tty ]] && stty "$tty" </dev/tty 2>/dev/null
-  [[ $c != cancel ]]
+  (( ok ))
 }
 
 _terhm_set() { # puts the command on the line, warning if it is dangerous

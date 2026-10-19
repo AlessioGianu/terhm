@@ -50,6 +50,10 @@ def run(name, argv):
         res["new"] = step("danger\r", 4)
         clear()
         res["cancel"] = step("\x07", 1) + step("\x03", 1) + step("echo alive\r", 1.5)
+        # bracketed paste and cursor editing in the request: "dnger" -> "danger"
+        step("\x07", 1); step("\x1b[200~dnger\x1b[201~", 0.5); step("\x1b[D" * 4 + "a", 0.5)
+        res["edit"] = step("\r", 4)
+        clear()
     # bash 5.2 regression: after Ctrl+G the executed line must be exactly the one shown
     step("list"); step("\x07", 4)
     res["exec"] = step("\r", 2)
@@ -71,6 +75,7 @@ def run(name, argv):
     if name == "bash":
         checks += [
             ("Ctrl+G on an empty line asks for a new request", "terhm ›" in res["prompt"] and "rm -rf build/" in res["new"]),
+            ("paste and arrow keys in the request", "rm -rf build/" in res["edit"] and "00~" not in res["edit"]),
             ("Ctrl+C cancels and the terminal stays normal", "alive" in res["cancel"] and "echo alive\r\necho alive" not in res["cancel"]),
         ]
     for label, ok in checks:
