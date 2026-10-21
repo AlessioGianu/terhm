@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# terhm - turns natural language into shell commands with a local model (nl2sh-1.5b or Qwen3.5-4B).
+# terhm - turns natural language into shell commands with a local model (Qwen3.5-4B).
 # Usage: terhm ask "text" | terhm fix "command" | terhm danger "command" | terhm context | terhm doctor | terhm status | terhm ssh host
 set -uo pipefail
 
@@ -10,28 +10,38 @@ CONFIG_FILE="${TERHM_CONFIG:-${XDG_CONFIG_HOME:-$HOME/.config}/terhm/config}"
 
 : "${TERHM_HOST:=127.0.0.1}"
 : "${TERHM_PORT:=11500}"
-: "${TERHM_TIMEOUT:=20}"
 : "${TERHM_FILES:=40}"
-: "${TERHM_TEMPERATURE:=0}"
 : "${TERHM_RETRIES:=2}"          # extra attempts when the proposed command fails the check
 
-# Model profile, written to the config by install.sh. Each profile has its own defaults
-# (the config or the environment can still override every value).
-: "${TERHM_MODEL:=nl2sh}"
-case "$TERHM_MODEL" in
-  qwen*)
-    # Qwen3.5 instruct mode (thinking off). The model may answer in a ``` block, so
-    # stop at the end of the block or at a blank line rather than at the first newline.
-    : "${TERHM_N_PREDICT:=160}"; : "${TERHM_REPEAT_PENALTY:=1.0}"
-    : "${TERHM_TOP_K:=20}"; : "${TERHM_TOP_P:=0.8}"
-    : "${TERHM_NO_THINK:=1}"; STOP_JSON='["\n```", "\n\n"]' ;;
+# Model: Qwen3.5-4B. TERHM_THINK: auto (default) = answers right away, and reasons a
+# little (up to TERHM_THINK_BUDGET tokens) only when the first answer was not good:
+# alternative, fix of a failed command, command that fails the checks. short = always
+# reasons a little; full = always reasons as long as it needs; off = never reasons.
+# (The config or the environment can override every value.)
+THINKING=0
+[ "${TERHM_NO_THINK:-}" = 1 ] && : "${TERHM_THINK:=off}"
+: "${TERHM_THINK:=auto}"; : "${TERHM_THINK_BUDGET:=256}"
+: "${TERHM_REPEAT_PENALTY:=1.0}"; : "${TERHM_TOP_K:=20}"
+# instruct mode: the model may answer in a ``` block, so stop at the end of the block
+# or at a blank line rather than at the first newline
+QWEN_STOP='["\n```", "\n\n"]'
+case "$TERHM_THINK" in
+  short|full)
+    # reasons in a <think> block, then answers: room for the reasoning, more time,
+    # the model card's thinking settings, no stop strings
+    THINKING=1; TERHM_NO_THINK=0
+    if [ "$TERHM_THINK" = short ]; then
+      : "${TERHM_N_PREDICT:=$TERHM_THINK_BUDGET}"; : "${TERHM_TIMEOUT:=40}"
+    else
+      : "${TERHM_N_PREDICT:=1024}"; : "${TERHM_TIMEOUT:=60}"
+    fi
+    : "${TERHM_TOP_P:=0.95}"; STOP_JSON='[]' ;;
   *)
-    # nl2sh: values from the model card, one line of output
-    : "${TERHM_TOP_K:=40}"; : "${TERHM_TOP_P:=0.9}"
-    : "${TERHM_NO_THINK:=0}"; STOP_JSON='["\n"]' ;;
+    [ "$TERHM_THINK" = auto ] || TERHM_THINK=off; TERHM_NO_THINK=1
+    : "${TERHM_N_PREDICT:=160}"; : "${TERHM_TOP_P:=0.8}"; STOP_JSON=$QWEN_STOP ;;
 esac
-: "${TERHM_N_PREDICT:=64}"
-: "${TERHM_REPEAT_PENALTY:=1.08}"
+: "${TERHM_TIMEOUT:=20}"
+: "${TERHM_TEMPERATURE:=0}"
 : "${TERHM_PROJECT_CONTEXT:=1}"  # project type, build targets, scripts, services, ROS 2 workspace
 : "${TERHM_TOOLS_CONTEXT:=1}"    # developer tools installed on the system
 
@@ -322,14 +332,18 @@ build_context() {
   printf 'files: %s\n' "$(list_files)"
 }
 
-# Cleans the model output: no <think> block, no ``` fence lines, first non-empty
-# line only, no surrounding backticks or leading "$ ".
+# Cleans the model output: no <think> block, the first line inside a ``` block if
+# there is one (else the first non-empty line), no surrounding backticks or leading "$ ".
 clean_output() {
   local s="$1" line found=0
   s="${s//$'\r'/}"
   # a thinking block (if the model or template still produced one)
   if [[ $s == *"</think>"* ]]; then s="${s##*</think>}"; fi
   s="${s#<think>}"
+  # reasoning models explain around the command: keep what follows the opening fence
+  if [[ $s == *$'\n```'* || $s == '```'* ]] && [[ ${s#*'```'} == *$'\n'* ]]; then
+    s="${s#*'```'}"; s="${s#*$'\n'}"
+  fi
   while IFS= read -r line; do
     line="${line#"${line%%[![:space:]]*}"}"
     line="${line%"${line##*[![:space:]]}"}"
@@ -397,7 +411,9 @@ generate() {
   payload=$(jq -n --arg sys "$(system_prompt)" --argjson m "$msgs" --argjson n "$TERHM_N_PREDICT" \
     --argjson t "$temp" --argjson rp "$TERHM_REPEAT_PENALTY" --argjson tk "$TERHM_TOP_K" \
     --argjson tp "$TERHM_TOP_P" --argjson stop "$STOP_JSON" --argjson nothink "$TERHM_NO_THINK" \
-    '{messages:([{role:"system", content:$sys}] + $m), max_tokens:$n, temperature:$t,
+    --argjson thinking "$THINKING" \
+    '{messages:([{role:"system", content:$sys}] + $m), max_tokens:$n,
+      temperature:(if $thinking == 1 and $t < 0.6 then 0.6 else $t end),
       repeat_penalty:$rp, repeat_last_n:64, top_k:$tk, top_p:$tp, cache_prompt:true, stop:$stop}
      + (if $nothink == 1 then {chat_template_kwargs:{enable_thinking:false}} else {} end)') \
     || { err "jq not available or payload error"; return 2; }
@@ -407,7 +423,38 @@ generate() {
     return 1
   fi
   out=$(printf '%s' "$resp" | jq -r '.choices[0].message.content // empty' 2>/dev/null)
+  # out of tokens while still reasoning: what came back is not an answer
+  # (llama-server puts the reasoning in reasoning_content, or leaves it in content)
+  if [ "$THINKING" = 1 ] && [[ $out != *"</think>"* ]] && printf '%s' "$resp" | jq -e \
+      '.choices[0].finish_reason == "length" and
+       (((.choices[0].message.content // "") | test("^\\s*$")) or (.choices[0].message.reasoning_content // "") == "")' \
+      >/dev/null 2>&1; then
+    if [ "$TERHM_THINK" = short ]; then
+      # reasoning budget used up: ask again with thinking off, giving the reasoning so
+      # far as notes, so the answer still benefits from it
+      local notes
+      notes=$(printf '%s' "$resp" | jq -r '.choices[0].message.reasoning_content // empty')
+      [ -n "$notes" ] || notes="${out#*<think>}"
+      msgs=$(jq -c --arg n "$notes" \
+        '.[-1].content += "\n\nYour notes so far (unfinished):\n" + $n + "\n\nNow reply with the command only."' <<< "$msgs")
+      THINKING=0 TERHM_NO_THINK=1 TERHM_N_PREDICT=160 STOP_JSON=$QWEN_STOP generate "$msgs" "$temp"
+      return
+    fi
+    err "the model ran out of tokens while reasoning (raise TERHM_N_PREDICT, now $TERHM_N_PREDICT)"
+    return 1
+  fi
   clean_output "$out"
+}
+
+# Runs "$@" with a short reasoning when TERHM_THINK=auto (the first answer was not
+# good enough); otherwise as configured.
+with_reasoning() {
+  if [ "${TERHM_THINK:-}" = auto ]; then
+    THINKING=1 TERHM_NO_THINK=0 TERHM_THINK=short TERHM_N_PREDICT=$TERHM_THINK_BUDGET \
+      TERHM_TOP_P=0.95 STOP_JSON='[]' TERHM_TIMEOUT=$(( TERHM_TIMEOUT > 40 ? TERHM_TIMEOUT : 40 )) "$@"
+  else
+    "$@"
+  fi
 }
 
 # Appends a turn to the conversation: $1 = messages, $2 = role, $3 = text.
@@ -424,7 +471,7 @@ propose() { # messages, temperature
     n=$((n + 1))
     msgs=$(add_msg "$msgs" assistant "$out")
     msgs=$(add_msg "$msgs" user "That command does not work here: ${problems}Reply with a different single command that works on this system.")
-    out=$(generate "$msgs" "$temp") || return $?
+    out=$(with_reasoning generate "$msgs" "$temp") || return $?
   done
   if [ -z "$out" ]; then err "the model produced no command"; return 1; fi
   printf '%s\n' "$out"
@@ -443,6 +490,7 @@ cmd_ask() {
       msgs=$(add_msg "$msgs" assistant "$TERHM_PREV")
       msgs=$(add_msg "$msgs" user "Give a different command for the same request.")
     fi
+    with_reasoning propose "$msgs" "$temp"; return
   fi
   propose "$msgs" "$temp"
 }
@@ -476,12 +524,12 @@ cmd_fix() {
   else
     msgs=$(add_msg '[]' user "Fix this command, $why: $cmd")
   fi
-  out=$(propose "$msgs" "$TERHM_TEMPERATURE") || return $?
+  out=$(with_reasoning propose "$msgs" "$TERHM_TEMPERATURE") || return $?
   # same command as before: ask for something different, with more randomness
   if [ "$out" = "$cmd" ]; then
     msgs=$(add_msg "$msgs" assistant "$out")
     msgs=$(add_msg "$msgs" user "That is the same command that failed. Give a different one.")
-    out=$(propose "$msgs" 0.7) || return $?
+    out=$(with_reasoning propose "$msgs" 0.7) || return $?
   fi
   printf '%s\n' "$out"
 }
@@ -502,7 +550,12 @@ cmd_doctor() {
   for c in curl jq grep; do
     if command -v "$c" >/dev/null 2>&1; then printf '[ok]   %s\n' "$c"; else printf '[FAIL] missing: %s\n' "$c"; ok=1; fi
   done
-  printf '[info] model profile: %s\n' "$TERHM_MODEL"
+  printf '[info] model: Qwen3.5-4B, reasoning: %s\n' "$TERHM_THINK"
+  # configs from older versions could select nl2sh-1.5b, which is no longer supported
+  case "${TERHM_MODEL:-}" in
+    ''|qwen*) ;;
+    *) printf '[FAIL] the config selects the model "%s", no longer supported: rerun ./install.sh\n' "$TERHM_MODEL"; ok=1 ;;
+  esac
   if find_prompt >/dev/null; then
     printf '[ok]   prompt: %s\n' "$(find_prompt)"
   else
@@ -649,9 +702,8 @@ cmd_ssh() {
   cp "$SELF" "$tmp/bin/terhm"; chmod 755 "$tmp/bin/terhm"
   cp "$prompt" "$tmp/prompts/system.txt"
   cp "$shdir"/terhm.bash "$shdir"/terhm.zsh "$shdir"/terhm.fish "$tmp/shell/"
-  # local settings (model profile, sampling, dangerous regex...), then the tunnel
+  # local settings (reasoning, sampling, dangerous regex...), then the tunnel
   { [ -f "$CONFIG_FILE" ] && grep -v '# terhm ssh$' "$CONFIG_FILE"
-    printf 'TERHM_MODEL=%q # terhm ssh\n' "$TERHM_MODEL"
     printf 'TERHM_HOST=127.0.0.1 # terhm ssh\n'
     printf 'TERHM_PORT="$TERHM_SSH_PORT" # terhm ssh\n'
   } > "$tmp/config"

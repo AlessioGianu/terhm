@@ -14,6 +14,7 @@ def answer(body):
     if "does not work here" in last: return "ls -la"
     if "100mb" in req: return " find . -type f -size +100M -exec ls -lh {} +"
     if "multifence" in req: return "```bash\nls -la\n```"
+    if "reasonfence" in req: return "Okay, the user wants the status.\n</think>\n\nUse this command:\n```bash\ngit status\n```\nIt shows the changes."
     if "think" in req: return "<think>\n\n</think>\n\ngit status"
     if "fence" in req: return " ```bash"
     if "wrapped" in req: return " `ls -la`"
@@ -37,7 +38,18 @@ class H(BaseHTTPRequestHandler):
         body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
         with open(LOG, "w") as f: json.dump(body, f)
         out = answer(body)
-        if body.get("temperature", 0) > 0.5 and out: out += " # alt"
-        self._send({"choices": [{"message": {"role": "assistant", "content": out}}]})
+        # alternative at 0.7 (reasoning alone uses 0.6)
+        if body.get("temperature", 0) > 0.65 and out and "</think>" not in out: out += " # alt"
+        users = [m["content"] for m in body["messages"] if m["role"] == "user"]
+        thinking = body.get("chat_template_kwargs", {}).get("enable_thinking", True)
+        if ("budgetthink" in users[0].lower() or "longthink" in users[0].lower()) and not thinking:   # second request after the budget
+            out = " git status" if "notes so far" in users[-1] and "they want git" in users[-1] else " ls"
+        elif "longthink" in users[0].lower():   # max_tokens reached, reasoning left in content
+            self._send({"choices": [{"finish_reason": "length",
+                        "message": {"role": "assistant", "content": "Okay, so the user wants"}}]}); return
+        elif "budgetthink" in users[0].lower():   # max_tokens reached, reasoning extracted
+            self._send({"choices": [{"finish_reason": "length", "message": {"role": "assistant",
+                        "content": "", "reasoning_content": "Status of the repo: they want git"}}]}); return
+        self._send({"choices": [{"finish_reason": "stop", "message": {"role": "assistant", "content": out}}]})
 
 HTTPServer(("127.0.0.1", int(sys.argv[1])), H).serve_forever()

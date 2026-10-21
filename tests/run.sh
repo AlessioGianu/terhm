@@ -35,8 +35,8 @@ check "strips leading \$" "ls -la" "$("$TERHM" ask "dollar")"
 check "chat endpoint: system" "system" "$(log '.messages[0].role')"
 check "chat endpoint: request" "hello" "$(log '.messages[1].content')"
 check "default temperature 0" "0" "$(log .temperature)"
-check "repeat penalty" "1.08" "$(log .repeat_penalty)"
-check "stop on newline" '["\n"]' "$(log -c .stop)"
+check "no repeat penalty" "true" "$(log '.repeat_penalty == 1')"
+check "top_k 20" "20" "$(log .top_k)"
 
 # context: directory, git branch, exit code, history
 T=$(mktemp -d); (cd "$T" && git init -q -b trunk . && touch alpha.txt beta.txt)
@@ -77,16 +77,46 @@ check "project and tools context can be turned off" "1" "$?"
 rm -rf "$T"
 "$TERHM" context | grep -q "^installed tools: .*git\|^installed tools: .*jq"; check "installed tools listed" "0" "$?"
 
-# model profiles
-"$TERHM" ask "hello" >/dev/null
-check "nl2sh: no thinking flag" "null" "$(log -c .chat_template_kwargs)"
-TERHM_MODEL=qwen3.5-4b "$TERHM" ask "hello" >/dev/null
-check "qwen: thinking off" "false" "$(log .chat_template_kwargs.enable_thinking)"
-check "qwen: stops at fence end or blank line" '["\n```","\n\n"]' "$(log -c .stop)"
-check "qwen: top_k 20" "20" "$(log .top_k)"
-check "qwen: no repeat penalty" "1.0" "$(log .repeat_penalty)"
-check "qwen: longer output" "160" "$(log .max_tokens)"
-check "qwen: config override" "0.5" "$(TERHM_MODEL=qwen3.5-4b TERHM_TOP_P=0.5 "$TERHM" ask hello >/dev/null; log .top_p)"
+# reasoning modes
+TERHM_THINK=off "$TERHM" ask "hello" >/dev/null
+check "off: thinking off" "false" "$(log .chat_template_kwargs.enable_thinking)"
+check "off: stops at fence end or blank line" '["\n```","\n\n"]' "$(log -c .stop)"
+check "off: longer output" "160" "$(log .max_tokens)"
+TERHM_NO_THINK=1 "$TERHM" ask "hello" >/dev/null
+check "TERHM_NO_THINK=1 still means no reasoning" "false" "$(log .chat_template_kwargs.enable_thinking)"
+Q="env $TERHM"
+$Q ask "hello" >/dev/null
+check "auto (default): first answer without reasoning" "false" "$(log .chat_template_kwargs.enable_thinking)"
+check "auto: first answer is short" "160" "$(log .max_tokens)"
+check "auto: first answer at temperature 0" "0" "$(log .temperature)"
+TERHM_ALT=1 TERHM_PREV="ls" $Q ask "hello" >/dev/null
+check "auto: alternative reasons" "null" "$(log .chat_template_kwargs)"
+check "auto: alternative reasoning budget" "256" "$(log .max_tokens)"
+$Q fix --status 2 -- "ls /nope" >/dev/null
+check "auto: fix reasons" "null" "$(log .chat_template_kwargs)"
+check "auto: fix at temperature 0.6 at least" "0.6" "$(log .temperature)"
+out=$($Q ask "clipboard"); check "auto: command failing the checks -> reasons on the retry" "ls -la" "${out%% #*}"
+check "auto: the retry reasons" "256" "$(log .max_tokens)"
+Q="env TERHM_THINK=short $TERHM"
+$Q ask "hello" >/dev/null
+check "short: thinking on" "null" "$(log .chat_template_kwargs)"
+check "short: reasoning budget" "256" "$(log .max_tokens)"
+check "short: temperature 0.6" "0.6" "$(log .temperature)"
+check "short: no stop strings" "[]" "$(log -c .stop)"
+check "short: command after the reasoning, inside the fence" "git status" "$($Q ask "reasonfence")"
+check "short: budget used up -> answers with the reasoning as notes" "git status" "$($Q ask "budgetthink")"
+check "short: second request has thinking off" "false" "$(log .chat_template_kwargs.enable_thinking)"
+check "short: second request is short" "160" "$(log .max_tokens)"
+check "short: reasoning left in content is used too" "ls" "$($Q ask "longthink")"
+check "short: budget can be changed" "100" "$(TERHM_THINK_BUDGET=100 $Q ask hello >/dev/null; log .max_tokens)"
+Q="env TERHM_THINK=full $TERHM"
+$Q ask "hello" >/dev/null
+check "full: room to reason" "1024" "$(log .max_tokens)"
+check "full: command after the reasoning" "git status" "$($Q ask "reasonfence")"
+$Q ask "longthink" >/dev/null 2>&1; check "full: out of tokens while reasoning -> no command" "1" "$?"
+$Q ask "longthink" 2>&1 | grep -qF "ran out of tokens while reasoning"; check "full: says why" "0" "$?"
+TERHM_MODEL=nl2sh "$TERHM" doctor 2>/dev/null | grep -qF 'model "nl2sh", no longer supported'; check "doctor: old nl2sh config -> rerun install" "0" "$?"
+check "config override" "0.5" "$(TERHM_TOP_P=0.5 "$TERHM" ask hello >/dev/null; log .top_p)"
 
 # no hand-written hints in the prompt
 sys_prompt | grep -q "hint:"; check "no fixed hints in the prompt" "1" "$?"

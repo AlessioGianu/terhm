@@ -2,12 +2,7 @@
 
 A terminal that works as usual until you press **Ctrl+G**: describe what you want to do in plain language and a small **offline** model proposes the command, based on the current directory, the project in it (make, docker, npm, python, ROS 2…), git, the tools you have installed and recent commands.
 
-Two models to choose from at install time (both Q4 quantized, CPU only):
-
-| Model | Download | RAM | Notes |
-|---|---|---|---|
-| [nl2sh-1.5b](https://huggingface.co/ThorOdinson246/nl2sh-1.5b-Q4_K_M) (default) | ~1 GB | ~1.5 GB | Qwen2.5-Coder-1.5B fine-tuned to write shell commands. Fast. |
-| [Qwen3.5-4B](https://huggingface.co/Qwen/Qwen3.5-4B) ([GGUF](https://huggingface.co/unsloth/Qwen3.5-4B-GGUF)) | ~2.7 GB | ~4 GB | General model, slower but smarter; makes better use of the project context. Thinking mode is turned off. |
+The model is [Qwen3.5-4B](https://huggingface.co/Qwen/Qwen3.5-4B) ([GGUF](https://huggingface.co/unsloth/Qwen3.5-4B-GGUF), Q4 quantized, CPU only): ~2.7 GB download, ~4 GB of RAM. It answers right away and reasons only when the first answer was not good (configurable).
 
 ```
 $ find files bigger than 100MB      ← type, then press Ctrl+G
@@ -23,11 +18,11 @@ git clone https://github.com/YOUR-USER/terhm && cd terhm
 ./install.sh
 ```
 
-The script asks which model to use, downloads `llama-server` (llama.cpp) and the model (checksum verified), installs a **systemd user service** that starts at boot (with `loginctl enable-linger`) and adds the plugin to bash, zsh and fish (asking first).
+The script downloads `llama-server` (llama.cpp) and the model (checksum verified), installs a **systemd user service** that starts at boot (with `loginctl enable-linger`) and adds the plugin to bash, zsh and fish (asking first).
 
-Requirements: Linux (x86_64 or arm64), `systemd`, `curl`, `jq`, `tar`, ~1.5 GB of free RAM (~4 GB for Qwen3.5-4B).
+Requirements: Linux (x86_64 or arm64), `systemd`, `curl`, `jq`, `tar`, ~4 GB of free RAM.
 
-Useful options: `--model nl2sh` or `--model qwen3.5-4b` (skips the question), `--yes`, `--model-file ./file.gguf`, `--update-llama` (Qwen3.5 needs a recent llama.cpp), `--llama-server /path`, `--no-service`, `--no-shell-rc`. For another GGUF model with a chat template: `TERHM_MODEL_URL=... ./install.sh`. To switch model later, run `./install.sh` again and pick the other one.
+Useful options: `--yes`, `--model-file ./file.gguf`, `--update-llama` (Qwen3.5 needs a recent llama.cpp), `--llama-server /path`, `--no-service`, `--no-shell-rc`. For another GGUF model with a chat template: `TERHM_MODEL_URL=... ./install.sh`.
 
 ## Usage
 
@@ -64,15 +59,15 @@ Opens a normal SSH session with Ctrl+G working on the remote host. The model kee
 
 ## Configuration
 
-`~/.config/terhm/config` (see `config/terhm.conf`): model profile (`TERHM_MODEL`), port, timeout, number of context files, temperature, retries, regex of dangerous commands. To change the hotkey set `TERHM_KEY` before the plugin's `source` (zsh `'^X'`, bash `'\C-x'`, fish `\cx`).
+`~/.config/terhm/config` (see `config/terhm.conf`): reasoning mode (`TERHM_THINK`), port, timeout, number of context files, temperature, retries, regex of dangerous commands. To change the hotkey set `TERHM_KEY` before the plugin's `source` (zsh `'^X'`, bash `'\C-x'`, fish `\cx`).
 
 ## How it works
 
 ```
-Ctrl+G → shell plugin → terhm ask → HTTP localhost:11500/v1/chat/completions → llama-server (nl2sh-1.5b or Qwen3.5-4B) → command in the buffer
+Ctrl+G → shell plugin → terhm ask → HTTP localhost:11500/v1/chat/completions → llama-server (Qwen3.5-4B) → command in the buffer
 ```
 
-- System prompt in `prompts/system.txt` (the one recommended for nl2sh, plus OS, shell and how to use the context), temperature 0. nl2sh uses `repeat_penalty` 1.08 as its model card suggests; Qwen3.5 uses the model card's non-thinking settings (`top_k` 20, `top_p` 0.8) with `enable_thinking: false`.
+- System prompt in `prompts/system.txt` (OS, shell and how to use the context), temperature 0. Qwen3.5 answers right away and reasons only when the first answer was not good (`TERHM_THINK=auto`, the default): for the alternative (empty Enter after Ctrl+G), the fix of a failed command and a command that fails the checks. Reasoning means up to 256 tokens (`TERHM_THINK_BUDGET`) with the thinking settings (temperature 0.6, `top_p` 0.95); if the budget runs out, terhm asks again with thinking off and the reasoning so far as notes. `TERHM_THINK=short` always reasons a little (slower, ~10-30 s on CPU), `TERHM_THINK=full` always reasons as long as it needs (up to 1024 tokens, slow), `TERHM_THINK=off` never reasons. Without reasoning Qwen3.5 uses the model card's non-thinking settings (`top_k` 20, `top_p` 0.8) and `enable_thinking: false`. The `<think>` block is dropped and the command written after it is kept.
 - Context sent (see it with `terhm context`):
   - directory, git branch and number of changed files, first 40 entries of the directory (directories first, then files, hidden ones last);
   - **project**, in the current directory and at the git root: make targets, docker compose services, Dockerfiles, npm/pnpm/yarn/bun scripts, python tool (pip, uv, poetry, pipenv) and virtualenv, cmake, cargo, go, maven, gradle, helm, terraform…;
@@ -100,6 +95,6 @@ shellcheck -S warning bin/terhm install.sh shell/terhm.bash
 
 ## Limitations
 
-Small models make mistakes (Qwen3.5-4B fewer than nl2sh-1.5b, which was trained mostly on English requests): always read the command before pressing Enter. The default GGUF file is `nl2sh-1.5b-Q4_K_M.gguf` from the `ThorOdinson246/nl2sh-1.5b-Q4_K_M` repo (Apache-2.0); Qwen3.5-4B is `Qwen3.5-4B-Q4_K_M.gguf` from `unsloth/Qwen3.5-4B-GGUF` (Apache-2.0). If a name changes use `TERHM_MODEL_URL`.
+Small models make mistakes: always read the command before pressing Enter. The GGUF file is `Qwen3.5-4B-Q4_K_M.gguf` from `unsloth/Qwen3.5-4B-GGUF` (Apache-2.0). If a name changes use `TERHM_MODEL_URL`.
 
 License: MIT

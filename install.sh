@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# terhm installer: llama-server + GGUF model (nl2sh-1.5b or Qwen3.5-4B) + systemd service + shell plugins.
+# terhm installer: llama-server + GGUF model (Qwen3.5-4B) + systemd service + shell plugins.
 set -euo pipefail
 
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -9,7 +9,6 @@ CONF_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/terhm"
 UNIT_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user"
 PORT="${TERHM_PORT:-11500}"
 LLAMA_BIN=""; LOCAL_MODEL=""; YES=0; NO_RC=0; NO_SERVICE=0; SKIP_MODEL=0; UPDATE_LLAMA=0
-MODEL_CHOICE="${TERHM_MODEL:-}"
 
 info() { printf '\033[1;34m==>\033[0m %s\n' "$*"; }
 warn() { printf '\033[1;33m!!\033[0m  %s\n' "$*" >&2; }
@@ -20,16 +19,13 @@ usage() {
   cat <<USAGE
 Usage: ./install.sh [options]
   --yes                  do not ask for confirmation
-  --model NAME           model to use: nl2sh (default, ~1 GB) or qwen3.5-4b (~2.7 GB)
-                         without --model (and without --yes) the installer asks
   --llama-server PATH    use an existing llama-server
   --model-file PATH      use an already downloaded GGUF
   --skip-model           do not download the model
   --no-shell-rc          do not modify .bashrc/.zshrc/fish
   --no-service           do not install the systemd service
   --update-llama         download the latest llama.cpp even if one is already installed
-Variables: TERHM_PORT, TERHM_MODEL (same as --model), TERHM_MODEL_URL, TERHM_MODEL_REPO,
-           TERHM_MODEL_FILE, TERHM_MODEL_SHA256
+Variables: TERHM_PORT, TERHM_MODEL_URL, TERHM_MODEL_REPO, TERHM_MODEL_FILE, TERHM_MODEL_SHA256
 USAGE
 }
 
@@ -37,7 +33,6 @@ while [ $# -gt 0 ]; do
   case "$1" in
     --yes|-y) YES=1 ;;
     --llama-server) LLAMA_BIN="${2:?missing path}"; shift ;;
-    --model) MODEL_CHOICE="${2:?missing model name}"; shift ;;
     --model-file) LOCAL_MODEL="${2:?missing path}"; shift ;;
     --update-llama) UPDATE_LLAMA=1 ;;
     --skip-model) SKIP_MODEL=1 ;;
@@ -54,39 +49,12 @@ for c in curl jq tar; do command -v "$c" >/dev/null || die "missing dependency: 
 
 mkdir -p "$BIN_DIR" "$DATA_DIR/shell" "$DATA_DIR/prompts" "$CONF_DIR"
 
-# --- 0. model choice ------------------------------------------------------
-if [ -z "$MODEL_CHOICE" ] && [ -f "$CONF_DIR/config" ]; then
-  # reinstall: offer the model already configured as the default
-  prev=$(sed -n 's/^TERHM_MODEL=//p' "$CONF_DIR/config" | tail -n1 | tr -d "\"'")
-else
-  prev=""
-fi
-if [ -z "$MODEL_CHOICE" ] && [ "$YES" = 0 ] && [ -z "$LOCAL_MODEL" ] && [ -z "${TERHM_MODEL_URL:-}" ] && [ -t 0 ]; then
-  def=1; case "$prev" in qwen*) def=2 ;; esac
-  cat <<MENU
-Which model do you want to use?
-  1) nl2sh-1.5b   ~1 GB download, ~1.5 GB RAM. Fast, fine-tuned only for shell commands.
-  2) Qwen3.5-4B   ~2.7 GB download, ~4 GB RAM. Slower, smarter, uses the project
-                  context better (make, docker, ROS 2, npm...).
-MENU
-  read -r -p "Choice [$def]: " a || a=""
-  case "${a:-$def}" in 2|q*|Q*) MODEL_CHOICE=qwen3.5-4b ;; *) MODEL_CHOICE=nl2sh ;; esac
-fi
-[ -n "$MODEL_CHOICE" ] || MODEL_CHOICE="${prev:-nl2sh}"
-case "$MODEL_CHOICE" in
-  nl2sh|nl2sh-1.5b)
-    MODEL_CHOICE=nl2sh
-    DEF_REPO="ThorOdinson246/nl2sh-1.5b-Q4_K_M"; DEF_FILE="nl2sh-1.5b-Q4_K_M.gguf"
-    DEF_SHA="6f8a17a11129a31074c944f4c2602453fafd9de43bdaeb1630a8f511ec820f71"
-    MODEL_SIZE="~1 GB"; MODEL_RAM_MB=1500; SERVER_EXTRA="" ;;
-  qwen|qwen3.5|qwen3.5-4b|Qwen/Qwen3.5-4B)
-    MODEL_CHOICE=qwen3.5-4b
-    DEF_REPO="unsloth/Qwen3.5-4B-GGUF"; DEF_FILE="Qwen3.5-4B-Q4_K_M.gguf"
-    DEF_SHA="00fe7986ff5f6b463e62455821146049db6f9313603938a70800d1fb69ef11a4"
-    # --jinja: use the model's chat template, needed to turn thinking off per request
-    MODEL_SIZE="~2.7 GB"; MODEL_RAM_MB=4000; SERVER_EXTRA="--jinja" ;;
-  *) die "unknown model: $MODEL_CHOICE (use nl2sh or qwen3.5-4b)" ;;
-esac
+# --- 0. model ------------------------------------------------------------
+MODEL_NAME="Qwen3.5-4B"
+DEF_REPO="unsloth/Qwen3.5-4B-GGUF"; DEF_FILE="Qwen3.5-4B-Q4_K_M.gguf"
+DEF_SHA="00fe7986ff5f6b463e62455821146049db6f9313603938a70800d1fb69ef11a4"
+# --jinja: use the model's chat template, needed to turn thinking off per request
+MODEL_SIZE="~2.7 GB"; MODEL_RAM_MB=4000; SERVER_EXTRA="--jinja"
 MODEL_REPO="${TERHM_MODEL_REPO:-$DEF_REPO}"
 MODEL_FILE="${TERHM_MODEL_FILE:-$DEF_FILE}"
 MODEL_URL="${TERHM_MODEL_URL:-https://huggingface.co/${MODEL_REPO}/resolve/main/${MODEL_FILE}}"
@@ -96,10 +64,10 @@ if [ -z "${TERHM_MODEL_URL:-}${TERHM_MODEL_REPO:-}${TERHM_MODEL_FILE:-}" ]; then
 else
   MODEL_SHA256="${TERHM_MODEL_SHA256:-}"
 fi
-info "Model: $MODEL_CHOICE ($MODEL_FILE)"
+info "Model: $MODEL_NAME ($MODEL_FILE)"
 avail_mb=$(awk '/^MemAvailable:/ {print int($2 / 1024)}' /proc/meminfo 2>/dev/null || echo 0)
 if [ "${avail_mb:-0}" -gt 0 ] && [ "$avail_mb" -lt "$MODEL_RAM_MB" ]; then
-  warn "only ${avail_mb} MB of RAM available, $MODEL_CHOICE needs about ${MODEL_RAM_MB} MB"
+  warn "only ${avail_mb} MB of RAM available, $MODEL_NAME needs about ${MODEL_RAM_MB} MB"
 fi
 
 # --- 1. llama-server ------------------------------------------------------
@@ -111,9 +79,21 @@ download_llama() {
     *) die "architecture not supported by the automatic download: use --llama-server" ;;
   esac
   info "Looking for the latest llama.cpp binary release…"
-  tag=$(curl -fsSL "https://github.com/ggml-org/llama.cpp/releases" | grep -oE 'releases/tag/b[0-9]+' | head -n1 | sed 's#.*/##')
-  [ -n "$tag" ] || die "could not find the llama.cpp release (use --llama-server)"
-  url="https://github.com/ggml-org/llama.cpp/releases/download/$tag/llama-$tag-bin-ubuntu-$arch.tar.gz"
+  # the newest release whose binaries are uploaded already (a release appears on GitHub
+  # before its files, which take a while to build)
+  url=$(curl -fsSL "https://api.github.com/repos/ggml-org/llama.cpp/releases?per_page=10" 2>/dev/null \
+    | jq -r --arg a "bin-ubuntu-$arch.tar.gz" \
+        '[.[] | .assets[] | select(.name | endswith($a) and startswith("llama-")) | .browser_download_url][0] // empty' 2>/dev/null)
+  if [ -z "$url" ]; then
+    # API unavailable (rate limit...): the release page, checking that the file exists
+    for tag in $(curl -fsSL "https://github.com/ggml-org/llama.cpp/releases" | grep -oE 'releases/tag/b[0-9]+' | sed 's#.*/##' | awk '!s[$0]++' | head -n5); do
+      url="https://github.com/ggml-org/llama.cpp/releases/download/$tag/llama-$tag-bin-ubuntu-$arch.tar.gz"
+      curl -fsIL -o /dev/null "$url" && break
+      url=""
+    done
+  fi
+  [ -n "$url" ] || die "could not find the llama.cpp release (use --llama-server)"
+  tag=$(printf '%s' "$url" | grep -oE '/download/b[0-9]+/' | tr -d /); tag=${tag#download}
   tmp=$(mktemp -d)
   info "Downloading llama.cpp $tag ($arch)…"
   curl -fL --progress-bar -o "$tmp/llama.tgz" "$url" || die "download failed: $url"
@@ -149,6 +129,11 @@ elif [ ! -s "$MODEL_PATH" ]; then
     || die "model download failed. Check the URL or use --model-file / TERHM_MODEL_URL"
   mv "$MODEL_PATH.part" "$MODEL_PATH"
 fi
+# model of older versions, no longer used
+old_model="$DATA_DIR/nl2sh-1.5b-Q4_K_M.gguf"
+if [ -f "$old_model" ] && [ "$MODEL_PATH" != "$(readlink -f "$old_model")" ]; then
+  if ask "Delete the old nl2sh-1.5b model (~1 GB, no longer used)?"; then rm -f "$old_model"; fi
+fi
 # the default checksum only applies to the downloaded model, not to --model-file
 if [ -n "$LOCAL_MODEL" ] && [ -z "${TERHM_MODEL_SHA256:-}" ]; then MODEL_SHA256=""; fi
 if [ -n "$MODEL_SHA256" ] && [ -s "$MODEL_PATH" ]; then
@@ -162,12 +147,8 @@ install -m 0644 "$REPO_DIR"/shell/terhm.* "$DATA_DIR/shell/"
 install -m 0644 "$REPO_DIR/prompts/system.txt" "$DATA_DIR/prompts/"
 rm -f "$DATA_DIR/prompts/hints.txt"   # older versions
 [ -f "$CONF_DIR/config" ] || install -m 0644 "$REPO_DIR/config/terhm.conf" "$CONF_DIR/config"
-# the model profile (sampling, thinking off...) is read by bin/terhm from the config
-if grep -q '^TERHM_MODEL=' "$CONF_DIR/config"; then
-  sed -i "s/^TERHM_MODEL=.*/TERHM_MODEL=$MODEL_CHOICE/" "$CONF_DIR/config"
-else
-  printf '\n# model chosen at install time (nl2sh or qwen3.5-4b); rerun ./install.sh to change it\nTERHM_MODEL=%s\n' "$MODEL_CHOICE" >> "$CONF_DIR/config"
-fi
+# older versions wrote the chosen model (nl2sh or qwen3.5-4b) to the config: only Qwen3.5-4B now
+sed -i -e '/^# model chosen at install time/d' -e '/^TERHM_MODEL=/d' "$CONF_DIR/config"
 [ "$PORT" = 11500 ] || { grep -q '^TERHM_PORT=' "$CONF_DIR/config" || echo "TERHM_PORT=$PORT" >> "$CONF_DIR/config"; }
 case ":$PATH:" in *":$BIN_DIR:"*) ;; *) warn "$BIN_DIR is not in PATH: add it in your rc file" ;; esac
 
@@ -178,7 +159,7 @@ if [ "$NO_SERVICE" = 0 ]; then
     threads=$(( $(nproc) / 2 )); [ "$threads" -ge 2 ] || threads=2
     sed -e "s#@LLAMA_SERVER@#$LLAMA_BIN#" -e "s#@LLAMA_LIBDIR@#$(dirname "$LLAMA_BIN")#" \
         -e "s#@MODEL@#$MODEL_PATH#" -e "s#@PORT@#$PORT#" -e "s#@THREADS@#$threads#" \
-        -e "s#@EXTRA@#$SERVER_EXTRA#" -e "s#@MODEL_NAME@#$MODEL_CHOICE#" \
+        -e "s#@EXTRA@#$SERVER_EXTRA#" -e "s#@MODEL_NAME@#$MODEL_NAME#" \
         "$REPO_DIR/systemd/terhm.service.in" > "$UNIT_DIR/terhm.service"
     systemctl --user daemon-reload
     systemctl --user enable terhm.service
@@ -193,7 +174,7 @@ if [ "$NO_SERVICE" = 0 ]; then
     done
     if [ "$ready" = 0 ]; then
       warn "the server did not answer yet. Logs: journalctl --user -u terhm -e"
-      [ "$MODEL_CHOICE" = qwen3.5-4b ] && warn "Qwen3.5 needs a recent llama.cpp: if the logs say 'unknown model architecture', rerun ./install.sh --update-llama"
+      warn "Qwen3.5 needs a recent llama.cpp: if the logs say 'unknown model architecture', rerun ./install.sh --update-llama"
     fi
   else
     warn "user systemd not available: skipping the service (use --no-service to hide this warning)"
