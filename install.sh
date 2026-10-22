@@ -1,3 +1,4 @@
+
 #!/usr/bin/env bash
 # terhm installer: llama-server + GGUF model (Qwen3.5-4B) + systemd service + shell plugins.
 set -euo pipefail
@@ -83,10 +84,11 @@ download_llama() {
   # before its files, which take a while to build)
   url=$(curl -fsSL "https://api.github.com/repos/ggml-org/llama.cpp/releases?per_page=10" 2>/dev/null \
     | jq -r --arg a "bin-ubuntu-$arch.tar.gz" \
-        '[.[] | .assets[] | select(.name | endswith($a) and startswith("llama-")) | .browser_download_url][0] // empty' 2>/dev/null)
+        '[.[] | .assets[] | select(.name | endswith($a) and startswith("llama-")) | .browser_download_url][0] // empty' 2>/dev/null || true)
   if [ -z "$url" ]; then
     # API unavailable (rate limit...): the release page, checking that the file exists
-    for tag in $(curl -fsSL "https://github.com/ggml-org/llama.cpp/releases" | grep -oE 'releases/tag/b[0-9]+' | sed 's#.*/##' | awk '!s[$0]++' | head -n5); do
+    # (|| true: with pipefail a failed curl/grep would end the script silently)
+    for tag in $( { curl -fsSL "https://github.com/ggml-org/llama.cpp/releases" | grep -oE 'releases/tag/b[0-9]+' | sed 's#.*/##' | awk '!s[$0]++' | head -n5; } 2>/dev/null || true); do
       url="https://github.com/ggml-org/llama.cpp/releases/download/$tag/llama-$tag-bin-ubuntu-$arch.tar.gz"
       curl -fsIL -o /dev/null "$url" && break
       url=""
