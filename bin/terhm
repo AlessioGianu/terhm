@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
-# terhm - turns natural language into shell commands with a local model (Qwen3.5-4B).
+# terhm - turns natural language into shell commands with Gemini, or a local offline model.
 # Usage: terhm ask "text" | terhm fix "command" | terhm danger "command" | terhm context | terhm doctor | terhm status | terhm ssh host
 set -uo pipefail
 
-TERHM_VERSION="0.3.0"
+TERHM_VERSION="0.4.0"
 CONFIG_FILE="${TERHM_CONFIG:-${XDG_CONFIG_HOME:-$HOME/.config}/terhm/config}"
 # shellcheck disable=SC1090
 [ -f "$CONFIG_FILE" ] && . "$CONFIG_FILE"
@@ -13,35 +13,21 @@ CONFIG_FILE="${TERHM_CONFIG:-${XDG_CONFIG_HOME:-$HOME/.config}/terhm/config}"
 : "${TERHM_FILES:=40}"
 : "${TERHM_RETRIES:=2}"          # extra attempts when the proposed command fails the check
 
-# Model: Qwen3.5-4B. TERHM_THINK: auto (default) = answers right away, and reasons a
-# little (up to TERHM_THINK_BUDGET tokens) only when the first answer was not good:
-# alternative, fix of a failed command, command that fails the checks. short = always
-# reasons a little; full = always reasons as long as it needs; off = never reasons.
-# (The config or the environment can override every value.)
-THINKING=0
-[ "${TERHM_NO_THINK:-}" = 1 ] && : "${TERHM_THINK:=off}"
-: "${TERHM_THINK:=auto}"; : "${TERHM_THINK_BUDGET:=256}"
-: "${TERHM_REPEAT_PENALTY:=1.0}"; : "${TERHM_TOP_K:=20}"
-# instruct mode: the model may answer in a ``` block, so stop at the end of the block
-# or at a blank line rather than at the first newline
-QWEN_STOP='["\n```", "\n\n"]'
-case "$TERHM_THINK" in
-  short|full)
-    # reasons in a <think> block, then answers: room for the reasoning, more time,
-    # the model card's thinking settings, no stop strings
-    THINKING=1; TERHM_NO_THINK=0
-    if [ "$TERHM_THINK" = short ]; then
-      : "${TERHM_N_PREDICT:=$TERHM_THINK_BUDGET}"; : "${TERHM_TIMEOUT:=40}"
-    else
-      : "${TERHM_N_PREDICT:=1024}"; : "${TERHM_TIMEOUT:=60}"
-    fi
-    : "${TERHM_TOP_P:=0.95}"; STOP_JSON='[]' ;;
-  *)
-    [ "$TERHM_THINK" = auto ] || TERHM_THINK=off; TERHM_NO_THINK=1
-    : "${TERHM_N_PREDICT:=160}"; : "${TERHM_TOP_P:=0.8}"; STOP_JSON=$QWEN_STOP ;;
-esac
-: "${TERHM_TIMEOUT:=20}"
+# Models: online = Gemini (API key from install.sh), offline = nl2sh-1.5b served by a
+# local llama-server, used as a backup when Gemini cannot be reached.
+# TERHM_MODE: auto (default) = Gemini, offline model if Gemini fails; online; offline.
+: "${TERHM_MODE:=auto}"
+: "${TERHM_GEMINI_MODEL:=gemini-3.5-flash-lite}"
+: "${TERHM_GEMINI_URL:=https://generativelanguage.googleapis.com/v1beta/openai}"
+: "${TERHM_GEMINI_TIMEOUT:=15}"
+: "${TERHM_GEMINI_KEY_FILE:=${XDG_CONFIG_HOME:-$HOME/.config}/terhm/gemini.key}"
+: "${TERHM_OFFLINE:=1}"           # 0 = the offline model is not installed
+: "${TERHM_OFFLINE_NAME:=nl2sh-1.5b}"
+: "${TERHM_TIMEOUT:=20}"          # max seconds to wait for the offline model
 : "${TERHM_TEMPERATURE:=0}"
+# offline model sampling (nl2sh model card): one line of output
+: "${TERHM_N_PREDICT:=64}"; : "${TERHM_REPEAT_PENALTY:=1.08}"
+: "${TERHM_TOP_K:=40}"; : "${TERHM_TOP_P:=0.9}"
 : "${TERHM_PROJECT_CONTEXT:=1}"  # project type, build targets, scripts, services, ROS 2 workspace
 : "${TERHM_TOOLS_CONTEXT:=1}"    # developer tools installed on the system
 
@@ -102,7 +88,7 @@ compose_services() { # services of a compose file (top-level keys under "service
     }' "$1" 2>/dev/null | _words 12
 }
 
-npm_scripts() { jq -r '.scripts // {} | keys[]' "$1" 2>/dev/null | _words 15; }
+npm_scripts() { jq -r '.scripts // {} | keys[]' < "$1" 2>/dev/null | _words 15; }  # stdin: snap jq cannot open files in /tmp
 
 # "name build_type" of a ROS 2 package.xml
 ros_pkg_info() {
@@ -404,74 +390,171 @@ system_prompt() {
   printf '%s\n\n%s' "$h" "$(build_context)"
 }
 
-# One request to the model. $1 = chat messages (JSON array, without the system
-# prompt), $2 = temperature. Prints the cleaned command.
+# --- JSON without jq ---------------------------------------------------------
+# Messages are built in plain bash, so that over ssh the remote host needs no jq.
+
+json_str() { # JSON string literal of $1
+  local s="$1"
+  s="${s//\\/\\\\}"; s="${s//\"/\\\"}"
+  s="${s//$'\n'/\\n}"; s="${s//$'\r'/\\r}"; s="${s//$'\t'/\\t}"
+  if [[ $s == *[[:cntrl:]]* ]]; then s=$(printf '%s' "$s" | tr -d '\001-\037\177'); fi
+  printf '"%s"' "$s"
+}
+
+# Appends a turn to the conversation: $1 = messages (JSON array), $2 = role, $3 = text.
+add_msg() {
+  local m
+  m="{\"role\":\"$2\",\"content\":$(json_str "$3")}"
+  if [ "$1" = "[]" ]; then printf '[%s]' "$m"; else printf '%s,%s]' "${1%]}" "$m"; fi
+}
+
+# --- progress on the terminal ---------------------------------------------
+# The shell plugins set TERHM_PROGRESS=1: terhm then shows on the terminal which model
+# is answering while it waits (online / offline / via ssh).
+progress() {
+  [ "${TERHM_PROGRESS:-0}" = 1 ] || return 0
+  { printf '\r\033[K\033[2mterhm: %s [%s]\033[0m' "${TERHM_PROGRESS_MSG:-thinking…}" "$*" > /dev/tty; } 2>/dev/null
+  return 0
+}
+
+# --- backends -------------------------------------------------------------
+gemini_key() {
+  if [ -n "${TERHM_GEMINI_KEY:-}" ]; then printf '%s' "$TERHM_GEMINI_KEY"
+  elif [ -n "${GEMINI_API_KEY:-}" ]; then printf '%s' "$GEMINI_API_KEY"
+  elif [ -r "$TERHM_GEMINI_KEY_FILE" ]; then tr -d '[:space:]' < "$TERHM_GEMINI_KEY_FILE"
+  fi
+}
+online_enabled() { [ "$TERHM_MODE" != offline ] && [ -n "$(gemini_key)" ]; }
+offline_enabled() { [ "$TERHM_MODE" != online ] && [ "$TERHM_OFFLINE" = 1 ]; }
+
+# What will answer, as shown while waiting.
+mode_label() {
+  if [ -n "${TERHM_SSH_PORT:-}" ]; then printf '%s, via your machine' "${TERHM_SSH_MODE:-model}"
+  elif online_enabled; then printf 'online · %s' "$TERHM_GEMINI_MODEL"
+  elif offline_enabled; then printf 'offline · %s' "$TERHM_OFFLINE_NAME"
+  else printf 'no model configured'
+  fi
+}
+
+# Gemini (OpenAI-compatible endpoint). $1 = messages with the system prompt, $2 = effort
+# (minimal: first answer; low: alternative, fix, retry). Prints the content; on error
+# prints why and returns 1. The key goes in a header read from a pipe, so it never
+# shows up in the process list.
+call_gemini() {
+  local msgs="$1" effort="$2" payload resp code body
+  payload=$(jq -nc --arg model "$TERHM_GEMINI_MODEL" --argjson m "$msgs" --arg e "$effort" \
+    '{model:$model, messages:$m, reasoning_effort:$e}') || { echo "payload error"; return 1; }
+  resp=$(printf '%s' "$payload" | curl -sS --max-time "$TERHM_GEMINI_TIMEOUT" -w '\n%{http_code}' \
+      -H 'Content-Type: application/json' -H @<(printf 'Authorization: Bearer %s\n' "$(gemini_key)") \
+      --data-binary @- "$TERHM_GEMINI_URL/chat/completions" 2>&1) || {
+    case "$resp" in
+      *"timed out"*) echo "no answer within ${TERHM_GEMINI_TIMEOUT}s" ;;
+      *) echo "not reachable" ;;
+    esac
+    return 1
+  }
+  code="${resp##*$'\n'}"; body="${resp%$'\n'*}"
+  if [ "$code" != 200 ]; then
+    local m why
+    case "$code" in
+      400|401|403) why="API key or model rejected" ;;
+      404) why="model $TERHM_GEMINI_MODEL not found" ;;
+      429) why="quota exceeded" ;;
+      *) why="error $code" ;;
+    esac
+    m=$(printf '%s' "$body" | jq -r 'if type == "array" then .[0] else . end | .error.message // empty' 2>/dev/null | head -c 200)
+    printf '%s%s\n' "$why" "${m:+: $m}"
+    return 1
+  fi
+  printf '%s' "$body" | jq -r '.choices[0].message.content // empty' 2>/dev/null
+}
+
+# Offline model (llama-server). $1 = messages with the system prompt, $2 = temperature.
+call_offline() {
+  local msgs="$1" temp="$2" payload resp
+  payload=$(jq -nc --argjson m "$msgs" --argjson n "$TERHM_N_PREDICT" --argjson t "$temp" \
+    --argjson rp "$TERHM_REPEAT_PENALTY" --argjson tk "$TERHM_TOP_K" --argjson tp "$TERHM_TOP_P" \
+    '{messages:$m, max_tokens:$n, temperature:$t, repeat_penalty:$rp, repeat_last_n:64,
+      top_k:$tk, top_p:$tp, cache_prompt:true, stop:["\n"]}') || { echo "payload error"; return 1; }
+  if ! resp=$(printf '%s' "$payload" | curl -sS --max-time "$TERHM_TIMEOUT" -H 'Content-Type: application/json' \
+      --data-binary @- "$BASE_URL/v1/chat/completions" 2>&1); then
+    echo "offline model not responding at $BASE_URL (run: terhm doctor)"
+    return 1
+  fi
+  printf '%s' "$resp" | jq -r '.choices[0].message.content // empty' 2>/dev/null
+}
+
+# Asks the configured backends: Gemini first, then the offline model if Gemini fails.
+# $1 = messages with the system prompt, $2 = temperature, $3 = effort.
+# Prints the first line "online"/"offline: <why>", then the raw answer.
+complete() {
+  local msgs="$1" temp="$2" effort="$3" out why=""
+  if online_enabled; then
+    progress "online · $TERHM_GEMINI_MODEL"
+    if out=$(call_gemini "$msgs" "$effort"); then printf 'online\n%s' "$out"; return 0; fi
+    why="Gemini: $out"
+  fi
+  if offline_enabled; then
+    progress "offline · $TERHM_OFFLINE_NAME${why:+ — $why}"
+    if out=$(call_offline "$msgs" "$temp"); then printf 'offline: %s\n%s' "$why" "$out"; return 0; fi
+    why="${why:+$why; }$out"
+  fi
+  if [ -z "$why" ]; then
+    why="no model configured (TERHM_MODE=$TERHM_MODE): rerun install.sh to add a Gemini API key or the offline model"
+  elif [ "$TERHM_OFFLINE" != 1 ] && [ "$TERHM_MODE" != online ]; then
+    why="$why (no offline model installed: rerun install.sh to add it)"
+  fi
+  err "$why"
+  return 1
+}
+
+# Over ssh: the request goes through the tunnel to "terhm ssh" on your machine, which
+# asks Gemini or the offline model there (the API key never leaves your machine).
+complete_via_ssh() {
+  local body resp
+  body="{\"messages\":$1,\"temperature\":$2,\"effort\":\"$3\"}"
+  if ! resp=$(printf '%s' "$body" | curl -sS --max-time $(( TERHM_GEMINI_TIMEOUT + TERHM_TIMEOUT + 5 )) \
+      -H 'Content-Type: application/json' --data-binary @- -w '\n%{http_code}' \
+      "http://$TERHM_HOST:$TERHM_PORT/terhm" 2>/dev/null); then
+    err "cannot reach your machine through the ssh tunnel (was the session opened with terhm ssh?)"
+    return 1
+  fi
+  if [ "${resp##*$'\n'}" != 200 ]; then
+    resp="${resp%$'\n'*}"; err "${resp#terhm: }"; return 1
+  fi
+  printf '%s' "${resp%$'\n'*}"
+}
+
+# One request. $1 = chat messages (JSON array, without the system prompt),
+# $2 = temperature, $3 = effort. Prints the cleaned command.
 generate() {
-  local msgs="$1" temp="$2" payload resp out
-  payload=$(jq -n --arg sys "$(system_prompt)" --argjson m "$msgs" --argjson n "$TERHM_N_PREDICT" \
-    --argjson t "$temp" --argjson rp "$TERHM_REPEAT_PENALTY" --argjson tk "$TERHM_TOP_K" \
-    --argjson tp "$TERHM_TOP_P" --argjson stop "$STOP_JSON" --argjson nothink "$TERHM_NO_THINK" \
-    --argjson thinking "$THINKING" \
-    '{messages:([{role:"system", content:$sys}] + $m), max_tokens:$n,
-      temperature:(if $thinking == 1 and $t < 0.6 then 0.6 else $t end),
-      repeat_penalty:$rp, repeat_last_n:64, top_k:$tk, top_p:$tp, cache_prompt:true, stop:$stop}
-     + (if $nothink == 1 then {chat_template_kwargs:{enable_thinking:false}} else {} end)') \
-    || { err "jq not available or payload error"; return 2; }
-  if ! resp=$(curl -sS --max-time "$TERHM_TIMEOUT" -H 'Content-Type: application/json' \
-      -d "$payload" "$BASE_URL/v1/chat/completions" 2>&1); then
-    err "server unreachable at $BASE_URL (run: terhm doctor)"
-    return 1
-  fi
-  out=$(printf '%s' "$resp" | jq -r '.choices[0].message.content // empty' 2>/dev/null)
-  # out of tokens while still reasoning: what came back is not an answer
-  # (llama-server puts the reasoning in reasoning_content, or leaves it in content)
-  if [ "$THINKING" = 1 ] && [[ $out != *"</think>"* ]] && printf '%s' "$resp" | jq -e \
-      '.choices[0].finish_reason == "length" and
-       (((.choices[0].message.content // "") | test("^\\s*$")) or (.choices[0].message.reasoning_content // "") == "")' \
-      >/dev/null 2>&1; then
-    if [ "$TERHM_THINK" = short ]; then
-      # reasoning budget used up: ask again with thinking off, giving the reasoning so
-      # far as notes, so the answer still benefits from it
-      local notes
-      notes=$(printf '%s' "$resp" | jq -r '.choices[0].message.reasoning_content // empty')
-      [ -n "$notes" ] || notes="${out#*<think>}"
-      msgs=$(jq -c --arg n "$notes" \
-        '.[-1].content += "\n\nYour notes so far (unfinished):\n" + $n + "\n\nNow reply with the command only."' <<< "$msgs")
-      THINKING=0 TERHM_NO_THINK=1 TERHM_N_PREDICT=160 STOP_JSON=$QWEN_STOP generate "$msgs" "$temp"
-      return
-    fi
-    err "the model ran out of tokens while reasoning (raise TERHM_N_PREDICT, now $TERHM_N_PREDICT)"
-    return 1
-  fi
-  clean_output "$out"
-}
-
-# Runs "$@" with a short reasoning when TERHM_THINK=auto (the first answer was not
-# good enough); otherwise as configured.
-with_reasoning() {
-  if [ "${TERHM_THINK:-}" = auto ]; then
-    THINKING=1 TERHM_NO_THINK=0 TERHM_THINK=short TERHM_N_PREDICT=$TERHM_THINK_BUDGET \
-      TERHM_TOP_P=0.95 STOP_JSON='[]' TERHM_TIMEOUT=$(( TERHM_TIMEOUT > 40 ? TERHM_TIMEOUT : 40 )) "$@"
+  local msgs="$1" temp="$2" effort="${3:-minimal}" full resp mode
+  full="[{\"role\":\"system\",\"content\":$(json_str "$(system_prompt)")},${msgs#[}"
+  progress "$(mode_label)"
+  if [ -n "${TERHM_SSH_PORT:-}" ]; then
+    resp=$(complete_via_ssh "$full" "$temp" "$effort") || return 1
   else
-    "$@"
+    resp=$(complete "$full" "$temp" "$effort") || return 1
   fi
+  mode="${resp%%$'\n'*}"
+  if [[ $resp == *$'\n'* ]]; then resp="${resp#*$'\n'}"; else resp=""; fi
+  # fell back to the offline model: say why once the answer is there
+  case "$mode" in "offline: "?*) err "offline model used (${mode#offline: })" ;; esac
+  clean_output "$resp"
 }
-
-# Appends a turn to the conversation: $1 = messages, $2 = role, $3 = text.
-add_msg() { jq -c --arg r "$2" --arg c "$3" '. + [{role:$r, content:$c}]' <<< "$1"; }
 
 # Generate and check: if the command fails the checks, send the problems back to the
 # model, up to TERHM_RETRIES times. Prints the first valid command (or the last one).
-propose() { # messages, temperature
-  local msgs="$1" temp="$2" out problems n=0
-  out=$(generate "$msgs" "$temp") || return $?
+propose() { # messages, temperature, effort
+  local msgs="$1" temp="$2" effort="${3:-minimal}" out problems n=0
+  out=$(generate "$msgs" "$temp" "$effort") || return $?
   while [ -n "$out" ] && [ "${TERHM_CHECK:-1}" = "1" ] && [ "$n" -lt "$TERHM_RETRIES" ]; do
     problems=$(check_command "$out")
     [ -z "$problems" ] && break
     n=$((n + 1))
     msgs=$(add_msg "$msgs" assistant "$out")
     msgs=$(add_msg "$msgs" user "That command does not work here: ${problems}Reply with a different single command that works on this system.")
-    out=$(with_reasoning generate "$msgs" "$temp") || return $?
+    out=$(generate "$msgs" "$temp" low) || return $?
   done
   if [ -z "$out" ]; then err "the model produced no command"; return 1; fi
   printf '%s\n' "$out"
@@ -490,7 +573,7 @@ cmd_ask() {
       msgs=$(add_msg "$msgs" assistant "$TERHM_PREV")
       msgs=$(add_msg "$msgs" user "Give a different command for the same request.")
     fi
-    with_reasoning propose "$msgs" "$temp"; return
+    propose "$msgs" "$temp" low; return
   fi
   propose "$msgs" "$temp"
 }
@@ -524,14 +607,26 @@ cmd_fix() {
   else
     msgs=$(add_msg '[]' user "Fix this command, $why: $cmd")
   fi
-  out=$(with_reasoning propose "$msgs" "$TERHM_TEMPERATURE") || return $?
+  out=$(propose "$msgs" "$TERHM_TEMPERATURE" low) || return $?
   # same command as before: ask for something different, with more randomness
   if [ "$out" = "$cmd" ]; then
     msgs=$(add_msg "$msgs" assistant "$out")
     msgs=$(add_msg "$msgs" user "That is the same command that failed. Give a different one.")
-    out=$(with_reasoning propose "$msgs" 0.7) || return $?
+    out=$(propose "$msgs" 0.7 low) || return $?
   fi
   printf '%s\n' "$out"
+}
+
+# Internal, used by the "terhm ssh" proxy: reads {messages, temperature, effort} on stdin
+# and prints the answer of the local backends (first line: online / offline: why).
+cmd_complete() {
+  local body msgs temp effort
+  body=$(cat)
+  msgs=$(printf '%s' "$body" | jq -c '.messages | if type == "array" then . else error end') \
+    || { err "bad request"; return 2; }
+  temp=$(printf '%s' "$body" | jq -r '.temperature // 0 | tonumber')
+  effort=$(printf '%s' "$body" | jq -r '.effort // "minimal" | if test("^[a-z]+$") then . else "minimal" end')
+  TERHM_PROGRESS=0 complete "$msgs" "$temp" "$effort"
 }
 
 # Prints the context that would be sent with a request from the current directory.
@@ -541,36 +636,77 @@ cmd_danger() {
   printf '%s' "$1" | grep -Eq -- "$TERHM_DANGEROUS"
 }
 
-cmd_status() {
-  curl -fsS --max-time 3 "$BASE_URL/health" >/dev/null 2>&1 || return 1
+offline_up() { curl -fsS --max-time 3 "$BASE_URL/health" >/dev/null 2>&1; }
+
+# Checks the Gemini key and model without spending tokens. Prints why on failure.
+gemini_check() {
+  local code
+  code=$(curl -sS -o /dev/null -w '%{http_code}' --max-time 8 \
+    -H @<(printf 'Authorization: Bearer %s\n' "$(gemini_key)") \
+    "$TERHM_GEMINI_URL/models/$TERHM_GEMINI_MODEL" 2>/dev/null) || code=000
+  case "$code" in
+    200) return 0 ;;
+    000) printf 'Gemini not reachable (no internet?)' ;;
+    400|401|403) printf 'API key rejected' ;;
+    404) printf 'model %s not found (set TERHM_GEMINI_MODEL)' "$TERHM_GEMINI_MODEL" ;;
+    *) printf 'Gemini answered %s' "$code" ;;
+  esac
+  return 1
 }
 
+# exit 0 if at least one model can answer
+cmd_status() {
+  if [ -n "${TERHM_SSH_PORT:-}" ]; then
+    curl -fsS --max-time 3 "http://$TERHM_HOST:$TERHM_PORT/health" >/dev/null 2>&1; return
+  fi
+  { online_enabled && gemini_check >/dev/null; } || { offline_enabled && offline_up; } || return 1
+}
+
+# Prints the model that will answer (used by the zsh plugin while waiting).
+cmd_mode() { mode_label; echo; }
+
 cmd_doctor() {
-  local ok=0 c
+  local ok=0 c why online=0 offline=0
   for c in curl jq grep; do
     if command -v "$c" >/dev/null 2>&1; then printf '[ok]   %s\n' "$c"; else printf '[FAIL] missing: %s\n' "$c"; ok=1; fi
   done
-  printf '[info] model: Qwen3.5-4B, reasoning: %s\n' "$TERHM_THINK"
-  # configs from older versions could select nl2sh-1.5b, which is no longer supported
-  case "${TERHM_MODEL:-}" in
-    ''|qwen*) ;;
-    *) printf '[FAIL] the config selects the model "%s", no longer supported: rerun ./install.sh\n' "$TERHM_MODEL"; ok=1 ;;
-  esac
   if find_prompt >/dev/null; then
     printf '[ok]   prompt: %s\n' "$(find_prompt)"
   else
     printf '[FAIL] prompts/system.txt not found\n'; ok=1
   fi
+  printf '[info] mode: %s\n' "$TERHM_MODE"
   if [ -n "${TERHM_SSH_PORT:-}" ]; then
     printf '[info] ssh session: the model runs on your local machine, reached through the tunnel\n'
-  elif command -v systemctl >/dev/null 2>&1; then
-    printf '[info] service: %s\n' "$(systemctl --user is-active terhm.service 2>&1)"
+    if cmd_status; then printf '[ok]   your machine answers through the tunnel\n'
+    else printf '[FAIL] your machine does not answer through the tunnel\n'; ok=1; fi
+    return $ok
   fi
-  if cmd_status; then
-    printf '[ok]   server responding at %s\n' "$BASE_URL"
+  if [ "$TERHM_MODE" = offline ]; then
+    printf '[info] online (Gemini): off (TERHM_MODE=offline)\n'
+  elif [ -z "$(gemini_key)" ]; then
+    printf '[info] online (Gemini): no API key (%s). Rerun ./install.sh to add one\n' "$TERHM_GEMINI_KEY_FILE"
+  elif why=$(gemini_check); then
+    printf '[ok]   online: Gemini %s, API key valid\n' "$TERHM_GEMINI_MODEL"; online=1
   else
-    printf '[FAIL] server not responding at %s\n       try: systemctl --user status terhm ; journalctl --user -u terhm -e\n' "$BASE_URL"
-    ok=1
+    printf '[FAIL] online: Gemini %s: %s\n' "$TERHM_GEMINI_MODEL" "$why"
+  fi
+  if [ "$TERHM_MODE" = online ]; then
+    printf '[info] offline model: off (TERHM_MODE=online)\n'
+  elif [ "$TERHM_OFFLINE" != 1 ]; then
+    printf '[info] offline model: not installed (rerun ./install.sh to add it as a backup)\n'
+  else
+    command -v systemctl >/dev/null 2>&1 && \
+      printf '[info] service: %s\n' "$(systemctl --user is-active terhm.service 2>&1)"
+    if offline_up; then
+      printf '[ok]   offline: %s responding at %s\n' "$TERHM_OFFLINE_NAME" "$BASE_URL"; offline=1
+    else
+      printf '[FAIL] offline: %s not responding at %s\n       try: systemctl --user status terhm ; journalctl --user -u terhm -e\n' \
+        "$TERHM_OFFLINE_NAME" "$BASE_URL"
+    fi
+  fi
+  if [ $((online + offline)) = 0 ]; then
+    printf '[FAIL] no model can answer right now\n'; ok=1
   fi
   return $ok
 }
@@ -580,7 +716,39 @@ cmd_doctor() {
 # a reverse tunnel (ssh -R) lets the remote reach it, and a small bundle (this script,
 # the prompt, the shell plugins) is sent inside the ssh command and unpacked in
 # ~/.cache/terhm/ssh/ on the remote. Context (cwd, files, tools) comes from the remote.
-# Needs bash, curl and jq on the remote; nothing is installed there permanently.
+# The tunnel ends at a small proxy started here for the session ("terhm complete"
+# behind a python3 HTTP server), which asks Gemini or the offline model: the API key
+# never leaves this machine. Needs bash and curl on the remote (no jq); nothing is
+# installed there permanently.
+
+# HTTP proxy for the tunnel: POST /terhm -> "terhm complete", GET /health. Listens on
+# 127.0.0.1, prints its port, and exits when the terhm ssh process ($2) is gone.
+PROXY_PY='
+import os, subprocess, sys, threading, time
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+terhm, parent = sys.argv[1], int(sys.argv[2])
+class H(BaseHTTPRequestHandler):
+    def log_message(self, *a): pass
+    def reply(self, code, data):
+        self.send_response(code); self.send_header("Content-Type", "text/plain; charset=utf-8")
+        self.send_header("Content-Length", str(len(data))); self.end_headers(); self.wfile.write(data)
+    def do_GET(self):
+        self.reply(200 if self.path == "/health" else 404, b"ok\n")
+    def do_POST(self):
+        if self.path != "/terhm": return self.reply(404, b"not found")
+        body = self.rfile.read(min(int(self.headers.get("Content-Length") or 0), 4 << 20))
+        p = subprocess.run([terhm, "complete"], input=body, capture_output=True)
+        self.reply(200 if p.returncode == 0 else 502, p.stdout if p.returncode == 0 else p.stderr.strip())
+srv = ThreadingHTTPServer(("127.0.0.1", 0), H)
+print(srv.server_address[1], flush=True)
+def watch():
+    while True:
+        time.sleep(2)
+        try: os.kill(parent, 0)
+        except OSError: os._exit(0)
+threading.Thread(target=watch, daemon=True).start()
+srv.serve_forever()
+'
 
 find_shell_dir() {
   local p
@@ -623,12 +791,12 @@ EOF
 }
 
 # Script run by the remote sh: unpack the bundle, check the tunnel, start the shell.
-ssh_bootstrap() { # $1 = bundle id, $2 = remote port, $3 = bundle (tar.gz, base64)
+ssh_bootstrap() { # $1 = bundle id, $2 = remote port, $3 = bundle (tar.gz, base64), $4 = mode
   cat <<EOF
 base="\${XDG_CACHE_HOME:-\$HOME/.cache}/terhm/ssh"
 d="\$base/$1"
 missing=""
-for c in bash curl jq tar gzip base64; do command -v "\$c" >/dev/null 2>&1 || missing="\$missing \$c"; done
+for c in bash curl tar gzip base64; do command -v "\$c" >/dev/null 2>&1 || missing="\$missing \$c"; done
 if [ -n "\$missing" ]; then
   printf 'terhm: missing on this host:%s. Ctrl+G is not available in this session.\n' "\$missing" >&2
   exec "\${SHELL:-/bin/sh}" -l
@@ -645,9 +813,9 @@ TERHM_BUNDLE
 fi
 export TERHM_HOME="\$d" TERHM_CONFIG="\$d/config" TERHM_SSH_PORT=$2
 if curl -fsS --max-time 3 "http://127.0.0.1:$2/health" >/dev/null 2>&1; then
-  printf '\033[2mterhm: Ctrl+G uses the model on your local machine\033[0m\n' >&2
+  printf '\033[2mterhm: Ctrl+G uses the model on your local machine (%s)\033[0m\n' "$4" >&2
 else
-  printf 'terhm: cannot reach your local model through the tunnel (model not running locally, or port forwarding disabled on this server: AllowTcpForwarding)\n' >&2
+  printf 'terhm: cannot reach your machine through the tunnel (port forwarding disabled on this server? AllowTcpForwarding)\n' >&2
 fi
 sh_path="\${SHELL:-/bin/sh}"
 case "\${sh_path##*/}" in
@@ -695,17 +863,31 @@ cmd_ssh() {
 
   prompt=$(find_prompt) || { err "prompts/system.txt not found (TERHM_HOME=$TERHM_HOME)"; return 2; }
   shdir=$(find_shell_dir) || { err "shell plugins not found (TERHM_HOME=$TERHM_HOME)"; return 2; }
-  cmd_status || err "warning: the local model is not responding at $BASE_URL (Ctrl+G will fail until it is up)"
+  local mode tport proxy_pid="" fifo rc
+  mode=$(mode_label)
+  if [ -n "${TERHM_SSH_PORT:-}" ]; then
+    # already inside a terhm ssh session: forward the tunnel one more hop
+    tport="$TERHM_PORT"
+  else
+    cmd_status || err "warning: no model is answering right now (run: terhm doctor)"
+    command -v python3 >/dev/null 2>&1 || { err "terhm ssh needs python3 on this machine"; return 2; }
+    # the proxy prints its port on a fifo, then keeps running until this process ends
+    fifo=$(mktemp -u "${TMPDIR:-/tmp}/terhm-proxy.XXXXXX"); mkfifo -m 600 "$fifo" || return 1
+    python3 -c "$PROXY_PY" "$SELF" "$$" > "$fifo" 2>/dev/null & proxy_pid=$!
+    read -r -t 5 tport < "$fifo"; rm -f "$fifo"
+    case "$tport" in ''|*[!0-9]*) kill "$proxy_pid" 2>/dev/null; err "could not start the local proxy"; return 1 ;; esac
+  fi
 
   tmp=$(mktemp -d "${TMPDIR:-/tmp}/terhm-ssh.XXXXXX") || return 1
   mkdir -p "$tmp/bin" "$tmp/prompts" "$tmp/shell"
   cp "$SELF" "$tmp/bin/terhm"; chmod 755 "$tmp/bin/terhm"
   cp "$prompt" "$tmp/prompts/system.txt"
   cp "$shdir"/terhm.bash "$shdir"/terhm.zsh "$shdir"/terhm.fish "$tmp/shell/"
-  # local settings (reasoning, sampling, dangerous regex...), then the tunnel
-  { [ -f "$CONFIG_FILE" ] && grep -v '# terhm ssh$' "$CONFIG_FILE"
+  # local settings (sampling, dangerous regex...) without any API key, then the tunnel
+  { [ -f "$CONFIG_FILE" ] && grep -v -e '# terhm ssh$' -e 'GEMINI_API_KEY' -e 'TERHM_GEMINI_KEY' "$CONFIG_FILE"
     printf 'TERHM_HOST=127.0.0.1 # terhm ssh\n'
     printf 'TERHM_PORT="$TERHM_SSH_PORT" # terhm ssh\n'
+    printf 'TERHM_SSH_MODE=%q # terhm ssh\n' "$mode"
   } > "$tmp/config"
   ssh_write_rcfiles "$tmp"
   id="$TERHM_VERSION-$(cd "$tmp" && find . -type f | LC_ALL=C sort | xargs cat | sha256sum | cut -c1-12)"
@@ -713,11 +895,15 @@ cmd_ssh() {
   rm -rf "$tmp"
 
   rport="${TERHM_SSH_REMOTE_PORT:-$((20000 + RANDOM % 40000))}"
-  script=$(ssh_bootstrap "$id" "$rport" "$bundle" | base64 -w0)
+  script=$(ssh_bootstrap "$id" "$rport" "$bundle" "$mode" | base64 -w0)
   # Works whatever the remote login shell is (bash, zsh, fish, tcsh): only plain
   # words and one single-quoted string.
-  exec "$ssh_bin" -t -R "$rport:$TERHM_HOST:$TERHM_PORT" "${opts[@]}" "$host" \
+  set -- -t -R "$rport:127.0.0.1:$tport" "${opts[@]}" "$host" \
     "exec sh -c 'eval \"\$(echo $script | base64 -d)\"'"
+  if [ -z "$proxy_pid" ]; then exec "$ssh_bin" "$@"; fi
+  "$ssh_bin" "$@"; rc=$?
+  kill "$proxy_pid" 2>/dev/null
+  return $rc
 }
 
 usage() {
@@ -728,10 +914,11 @@ terhm $TERHM_VERSION
                             propose a fix for a failed command
   terhm danger "command"    exit 0 if the command looks dangerous
   terhm context             print the context sent to the model from this directory
-  terhm status              exit 0 if the server is up
+  terhm status              exit 0 if a model can answer (Gemini or the offline model)
+  terhm mode                print which model will answer
   terhm doctor              check the installation
   terhm ssh [ssh options] host
-                            ssh with Ctrl+G on the remote host, using the local model
+                            ssh with Ctrl+G on the remote host, using the models of this machine
 Config: $CONFIG_FILE
 USAGE
 }
@@ -742,6 +929,8 @@ case "${1:-help}" in
   danger) shift; if [ "${1:-}" = "--" ]; then shift; fi; cmd_danger "${1:-}" ;;
   context) cmd_context ;;
   status) cmd_status ;;
+  mode) cmd_mode ;;
+  complete) cmd_complete ;;
   doctor) cmd_doctor ;;
   ssh) shift; cmd_ssh "$@" ;;
   version|--version|-v) echo "terhm $TERHM_VERSION" ;;

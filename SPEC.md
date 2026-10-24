@@ -1,6 +1,6 @@
 # terhm: project specification
 
-> A normal terminal with a superpower: press a key combination, type in plain language and a small **offline** model (quantized Qwen3.5-4B) proposes the right command, based on the current directory and session.
+> A normal terminal with a superpower: press a key combination, type in plain language and a model (Gemini online, with the small nl2sh-1.5b as an optional **offline** backup) proposes the right command, based on the current directory and session.
 
 **Status:** draft v0.1 · **Proposed license:** MIT · **Platform:** Linux
 
@@ -26,7 +26,7 @@
 ```
 ┌──────────────────────┐   hotkey    ┌────────────────────┐   HTTP localhost   ┌──────────────────────┐
 │ Terminal (any)       │────────────▶│ Shell plugin       │───────────────────▶│ llama-server         │
-│ WezTerm / Kitty / …  │◀────────────│ zsh / bash / fish  │◀───────────────────│ Qwen3.5-4B GGUF Q4   │
+│ WezTerm / Kitty / …  │◀────────────│ zsh / bash / fish  │◀───────────────────│ Gemini / nl2sh-1.5b  │
 └──────────────────────┘  command    └────────────────────┘     JSON           │ (systemd service)    │
                           in buffer                                            └──────────────────────┘
 ```
@@ -52,13 +52,13 @@
 | F8 | `Esc` or `Ctrl+C` restore the original natural-language text. |
 | F9 | The service starts automatically at boot (even without a graphical login). |
 | F10 | If the daemon does not respond, the plugin shows a clear message and does not block the shell (5 s timeout). |
-| F11 | `terhm ssh host` opens an SSH session where the hotkey works on the remote host, using the local model through a reverse tunnel; nothing is installed permanently on the remote. |
+| F11 | `terhm ssh host` opens an SSH session where the hotkey works on the remote host, using the models of the local machine through a reverse tunnel and a local proxy (the API key stays local); nothing is installed permanently on the remote. |
 
 ## 5. Non-functional requirements
 
 - **Latency:** response in under 2 s on a modern CPU with a Q4-quantized 0.5B–1B model.
 - **RAM:** about 4 GB at steady state.
-- **Privacy:** no external connections after the model download. The server listens on `127.0.0.1` only.
+- **Privacy:** online mode sends the request and context to the Gemini API; offline mode makes no external connections after the model download. The server listens on `127.0.0.1` only.
 - **Minimal dependencies:** `curl`, `jq`, `systemd`. No mandatory Python.
 - **Compatibility:** zsh ≥ 5.8, bash ≥ 4.4, fish ≥ 3.4. Target distros: Ubuntu/Debian, Fedora, Arch.
 - **Reversibility:** `uninstall.sh` removes the service, plugins and model.
@@ -66,7 +66,7 @@
 ## 6. User experience
 
 1. The user types in the terminal: `find files bigger than 100MB`
-2. Presses `Ctrl+G`. A short indicator appears (e.g. `⏳ thinking…`).
+2. Presses `Ctrl+G`. A short indicator appears with the model in use (e.g. `thinking… [online · gemini-3.5-flash-lite]` or `[offline · nl2sh-1.5b]`).
 3. The line becomes: `find . -type f -size +100M -exec ls -lh {} +`
 4. The user reads it, edits it if they want, and presses **Enter** to run it.
 
@@ -74,7 +74,7 @@ Principles: no extra windows, no interruption of the flow; the model suggests, i
 
 ## 7. Model and inference
 
-- **Model:** Qwen3.5-4B, GGUF Q4_K_M. By default it reasons only for alternatives and fixes; the reasoning mode (`TERHM_THINK`) sets sampling, stop strings and output length.
+- **Models:** online Gemini (`gemini-3.5-flash-lite`, minimal reasoning, a little more for alternatives and fixes); offline backup nl2sh-1.5b, GGUF Q4_K_M, used when Gemini fails.
 - **Default parameters:** `temperature 0.1`, `n_predict 128`, `ctx 2048`, `threads = nproc/2`.
 - **System prompt** in `prompts/system.txt`, with 3–5 few-shot examples in the user's language.
 - Optional **GBNF grammar** to force a single line with no markdown or explanations.
@@ -157,7 +157,7 @@ terhm/
 
 1. Detect distro and architecture (x86_64, aarch64).
 2. Download or build `llama-server` (llama.cpp binary releases).
-3. Download the Qwen3.5-4B GGUF into `~/.local/share/terhm/` and verify its SHA256.
+3. Ask for the Gemini API key (checked, saved with mode 600) and whether to install the offline model; if yes, download the nl2sh-1.5b GGUF into `~/.local/share/terhm/` and verify its SHA256.
 4. Install the systemd user unit and enable it: `systemctl --user enable --now terhm`.
 5. Run `loginctl enable-linger $USER` for start at boot.
 6. Add the plugin's `source` line to the current shell's rc file (after confirmation).

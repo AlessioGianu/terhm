@@ -1,11 +1,15 @@
 # terhm
 
-A terminal that works as usual until you press **Ctrl+G**: describe what you want to do in plain language and a small **offline** model proposes the command, based on the current directory, the project in it (make, docker, npm, python, ROS 2…), git, the tools you have installed and recent commands.
+A terminal that works as usual until you press **Ctrl+G**: describe what you want to do in plain language and a model proposes the command, based on the current directory, the project in it (make, docker, npm, python, ROS 2…), git, the tools you have installed and recent commands.
 
-The model is [Qwen3.5-4B](https://huggingface.co/Qwen/Qwen3.5-4B) ([GGUF](https://huggingface.co/unsloth/Qwen3.5-4B-GGUF), Q4 quantized, CPU only): ~2.7 GB download, ~4 GB of RAM. It answers right away and reasons only when the first answer was not good (configurable).
+- **Online**: [Gemini](https://ai.google.dev/) (`gemini-3.5-flash-lite` by default) with your API key.
+- **Offline backup** (optional): [nl2sh-1.5b](https://huggingface.co/ThorOdinson246/nl2sh-1.5b-Q4_K_M) (Q4 GGUF, CPU only, ~1 GB download, ~1.5 GB of RAM) on a local llama-server. It answers when Gemini cannot be reached (no internet, quota exceeded, key rejected…).
+
+While it waits, terhm shows which one is answering: `terhm: thinking… [online · gemini-3.5-flash-lite]`, `[offline · nl2sh-1.5b — Gemini: not reachable]`, or over SSH `[online · gemini-3.5-flash-lite, via your machine]`.
 
 ```
 $ find files bigger than 100MB      ← type, then press Ctrl+G
+terhm: thinking… [online · gemini-3.5-flash-lite]
 $ find . -type f -size +100M -exec ls -lh {} +      ← the line becomes the command
 ```
 
@@ -18,11 +22,16 @@ git clone https://github.com/YOUR-USER/terhm && cd terhm
 ./install.sh
 ```
 
-The script downloads `llama-server` (llama.cpp) and the model (checksum verified), installs a **systemd user service** that starts at boot (with `loginctl enable-linger`) and adds the plugin to bash, zsh and fish (asking first).
+The installer asks two things:
 
-Requirements: Linux (x86_64 or arm64), `systemd`, `curl`, `jq`, `tar`, ~4 GB of free RAM.
+1. **Your Gemini API key** (create one for free at <https://aistudio.google.com/apikey>). It is checked right away and saved in `~/.config/terhm/gemini.key`, readable only by you. Leave it empty to use only the offline model.
+2. **Whether to install the offline backup model** nl2sh-1.5b. If yes, it downloads `llama-server` (llama.cpp) and the model (checksum verified), installs a **systemd user service** that starts at boot (with `loginctl enable-linger`).
 
-Useful options: `--yes`, `--model-file ./file.gguf`, `--update-llama` (Qwen3.5 needs a recent llama.cpp), `--llama-server /path`, `--no-service`, `--no-shell-rc`. For another GGUF model with a chat template: `TERHM_MODEL_URL=... ./install.sh`.
+Then it adds the plugin to bash, zsh and fish (asking first). Rerun `./install.sh` to change the key or add/remove the offline model.
+
+Requirements: Linux (x86_64 or arm64), `curl`, `jq`, `tar`; for the offline model also `systemd` and ~1.5 GB of free RAM; for `terhm ssh` also `python3`.
+
+Useful options: `--yes`, `--gemini-key KEY` (or `GEMINI_API_KEY=... ./install.sh --yes`), `--no-gemini`, `--offline` / `--no-offline`, `--model-file ./file.gguf`, `--update-llama`, `--llama-server /path`, `--no-service`, `--no-shell-rc`. Another Gemini model: `TERHM_GEMINI_MODEL=... ./install.sh`.
 
 ## Usage
 
@@ -42,7 +51,7 @@ The `terhm ›` prompt is bash-only for now; in zsh and fish `Ctrl+G` on an empt
 
 If the command looks dangerous (`rm -rf`, `sudo`, `dd`, `mkfs`, `curl | sh`…) a warning is shown.
 
-Commands: `terhm ask "..."`, `terhm fix --status N -- "command"`, `terhm context` (shows what is sent to the model from the current directory), `terhm doctor`, `terhm status`, `terhm ssh host` (see below).
+Commands: `terhm ask "..."`, `terhm fix --status N -- "command"`, `terhm context` (shows what is sent to the model from the current directory), `terhm doctor` (checks the key, Gemini and the offline model), `terhm status`, `terhm mode` (which model will answer), `terhm ssh host` (see below).
 
 ## Over SSH
 
@@ -50,24 +59,24 @@ Commands: `terhm ask "..."`, `terhm fix --status N -- "command"`, `terhm context
 terhm ssh user@server          # same arguments as ssh
 ```
 
-Opens a normal SSH session with Ctrl+G working on the remote host. The model keeps running on **your** machine: terhm adds a reverse tunnel (`ssh -R`) so the remote can reach it, and sends a small bundle (the `terhm` script, the prompt and the shell plugins, ~30 KB) inside the ssh command. It is unpacked in `~/.cache/terhm/ssh/` on the remote, and your usual login shell (bash, zsh or fish) starts with your own config plus the plugin. Nothing is installed on the remote and no model is downloaded there; the context (directory, project, installed tools) is the remote's.
+Opens a normal SSH session with Ctrl+G working on the remote host. The models are used from **your** machine: terhm starts a small local proxy for the session (needs `python3` locally) and a reverse tunnel (`ssh -R`) to it, and sends a small bundle (the `terhm` script, the prompt and the shell plugins) inside the ssh command. It is unpacked in `~/.cache/terhm/ssh/` on the remote, and your usual login shell (bash, zsh or fish) starts with your own config plus the plugin. Nothing is installed on the remote, no model is downloaded there and **your Gemini API key never leaves your machine**; the context (directory, project, installed tools) is the remote's. Gemini → offline fallback works the same way.
 
-- The remote needs `bash`, `curl` and `jq`, and must allow port forwarding (`AllowTcpForwarding`, on by default). If something is missing, you get a normal shell and a message saying why.
+- The remote needs only `bash` and `curl` (no `jq`), and must allow port forwarding (`AllowTcpForwarding`, on by default). If something is missing, you get a normal shell and a message saying why.
 - With a remote command (`terhm ssh host uptime`) or `-N`/`-T`/`-W`, it is just `ssh`.
 - To always use it: `alias ssh='terhm ssh'`.
 - It nests: `terhm ssh` from inside a `terhm ssh` session forwards the tunnel one more hop.
 
 ## Configuration
 
-`~/.config/terhm/config` (see `config/terhm.conf`): reasoning mode (`TERHM_THINK`), port, timeout, number of context files, temperature, retries, regex of dangerous commands. To change the hotkey set `TERHM_KEY` before the plugin's `source` (zsh `'^X'`, bash `'\C-x'`, fish `\cx`).
+`~/.config/terhm/config` (see `config/terhm.conf`): mode (`TERHM_MODE=auto|online|offline`), Gemini model and timeout (`TERHM_GEMINI_MODEL`, `TERHM_GEMINI_TIMEOUT`, default 15 s before falling back), offline model port, timeout and sampling, number of context files, retries, regex of dangerous commands. To change the hotkey set `TERHM_KEY` before the plugin's `source` (zsh `'^X'`, bash `'\C-x'`, fish `\cx`).
 
 ## How it works
 
 ```
-Ctrl+G → shell plugin → terhm ask → HTTP localhost:11500/v1/chat/completions → llama-server (Qwen3.5-4B) → command in the buffer
+Ctrl+G → shell plugin → terhm ask → Gemini (OpenAI-compatible API) ──fails?──▶ llama-server 127.0.0.1:11500 (nl2sh-1.5b) → command in the buffer
 ```
 
-- System prompt in `prompts/system.txt` (OS, shell and how to use the context), temperature 0. Qwen3.5 answers right away and reasons only when the first answer was not good (`TERHM_THINK=auto`, the default): for the alternative (empty Enter after Ctrl+G), the fix of a failed command and a command that fails the checks. Reasoning means up to 256 tokens (`TERHM_THINK_BUDGET`) with the thinking settings (temperature 0.6, `top_p` 0.95); if the budget runs out, terhm asks again with thinking off and the reasoning so far as notes. `TERHM_THINK=short` always reasons a little (slower, ~10-30 s on CPU), `TERHM_THINK=full` always reasons as long as it needs (up to 1024 tokens, slow), `TERHM_THINK=off` never reasons. Without reasoning Qwen3.5 uses the model card's non-thinking settings (`top_k` 20, `top_p` 0.8) and `enable_thinking: false`. The `<think>` block is dropped and the command written after it is kept.
+- System prompt in `prompts/system.txt` (OS, shell and how to use the context). Gemini answers with minimal reasoning (`reasoning_effort: minimal`) and reasons a little more (`low`) for the alternative, the fix of a failed command and a command that fails the checks. The offline model uses the nl2sh model card's settings (temperature 0, `top_k` 40, `top_p` 0.9, one line). The API key is sent in a header read from a pipe, so it never shows up in the process list.
 - Context sent (see it with `terhm context`):
   - directory, git branch and number of changed files, first 40 entries of the directory (directories first, then files, hidden ones last);
   - **project**, in the current directory and at the git root: make targets, docker compose services, Dockerfiles, npm/pnpm/yarn/bun scripts, python tool (pip, uv, poetry, pipenv) and virtualenv, cmake, cargo, go, maven, gradle, helm, terraform…;
@@ -79,7 +88,7 @@ Ctrl+G → shell plugin → terhm ask → HTTP localhost:11500/v1/chat/completio
   Only file names and a few small build files (Makefile, package.json, compose file, package.xml, setup.py) are read; no other file contents and no environment variable values except the names above. `.env` files are never read. Turn parts off with `TERHM_PROJECT_CONTEXT=0` and `TERHM_TOOLS_CONTEXT=0`.
 - No hand-written rules for specific commands: everything that ends up on the line is decided by the model.
 - **Check without running**: before proposing it, terhm checks the command's syntax (`bash -n`, `zsh -n` or `fish -n`) and that the programs it uses exist (including your shell's aliases and functions). If something is wrong, it sends the problem back to the model and retries (up to `TERHM_RETRIES`, default 2). Turn it off with `TERHM_CHECK=0`.
-- The server listens on `127.0.0.1` only. No telemetry.
+- Online mode sends the request and this context to Google (Gemini API); offline mode sends nothing out. The offline server and the ssh proxy listen on `127.0.0.1` only. No telemetry.
 
 ## A "pretty" terminal
 
@@ -88,13 +97,13 @@ Ctrl+G → shell plugin → terhm ask → HTTP localhost:11500/v1/chat/completio
 ## Development
 
 ```bash
-bash tests/run.sh          # tests with a fake server, no model needed
+bash tests/run.sh          # tests with fake Gemini and llama servers, no model or key needed
 python3 tests/pty_test.py  # interactive Ctrl+G tests in bash, zsh and fish (needs zsh and fish)
 shellcheck -S warning bin/terhm install.sh shell/terhm.bash
 ```
 
 ## Limitations
 
-Small models make mistakes: always read the command before pressing Enter. The GGUF file is `Qwen3.5-4B-Q4_K_M.gguf` from `unsloth/Qwen3.5-4B-GGUF` (Apache-2.0). If a name changes use `TERHM_MODEL_URL`.
+Models make mistakes: always read the command before pressing Enter. The offline GGUF file is `nl2sh-1.5b-Q4_K_M.gguf` from `ThorOdinson246/nl2sh-1.5b-Q4_K_M`. If a name changes use `TERHM_MODEL_URL`.
 
 License: MIT

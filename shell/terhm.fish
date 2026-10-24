@@ -26,7 +26,8 @@ function _terhm_postexec --on-event fish_postexec
     test "$TERHM_AUTOFIX" = 1; and test $_terhm_tries -lt $TERHM_AUTOFIX_MAX; or return
     set -g _terhm_tries (math $_terhm_tries + 1)
     printf '\e[2mterhm: command failed (exit %s), looking for a fix…\e[0m' $st >&2
-    set -l fix (env TERHM_SHELL=fish TERHM_KNOWN=(_terhm_known) \
+    set -l fix (env TERHM_SHELL=fish TERHM_KNOWN=(_terhm_known) TERHM_PROGRESS=1 \
+        TERHM_PROGRESS_MSG="command failed (exit $st), looking for a fix…" \
         TERHM_HISTORY=(string join '; ' (history --max=5)) \
         terhm fix --status $st --request "$_terhm_orig" -- "$argv[1]" 2>/dev/null)
     printf '\r\e[K' >&2
@@ -71,21 +72,25 @@ function terhm_suggest
     end
     set -l errf (mktemp)
     set -l out
+    printf '\r\e[K\e[2mterhm: thinking…\e[0m' >&2
     if test $fix -eq 1
         set -l orig ""
         test "$last" = "$_terhm_out"; and set orig $_terhm_orig
-        set out (env TERHM_SHELL=fish TERHM_KNOWN=(_terhm_known) TERHM_HISTORY="$hist" \
+        set out (env TERHM_SHELL=fish TERHM_KNOWN=(_terhm_known) TERHM_HISTORY="$hist" TERHM_PROGRESS=1 \
             terhm fix --status $st --request "$orig" -- "$last" 2>$errf)
     else
-        set out (env TERHM_SHELL=fish TERHM_KNOWN=(_terhm_known) TERHM_ALT=$alt \
+        set out (env TERHM_SHELL=fish TERHM_KNOWN=(_terhm_known) TERHM_ALT=$alt TERHM_PROGRESS=1 \
             TERHM_PREV="$_terhm_out" terhm ask "$req" 2>$errf)
     end
     set -l rc $status
+    printf '\r\e[K' >&2
     set out (string join ' ' -- $out)
     if test $rc -ne 0; or test -z "$out"
-        echo; cat $errf >&2; rm -f $errf
+        cat $errf >&2; rm -f $errf
         commandline -f repaint; return
     end
+    # e.g. Gemini not reachable, offline model used
+    test -s $errf; and printf '\e[2m%s\e[0m\n' (cat $errf) >&2
     rm -f $errf
     test $alt -eq 0; and test $fix -eq 0; and set -g _terhm_orig "$req"
     set -g _terhm_out "$out"

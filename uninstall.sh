@@ -12,8 +12,8 @@ for rc in "$HOME/.bashrc" "$HOME/.zshrc" "${XDG_CONFIG_HOME:-$HOME/.config}/fish
   [ -f "$rc" ] || continue
   sed -i '/^# terhm$/d;/terhm\/shell/d' "$rc"
 done
-read -r -p "Also delete the model and llama.cpp in $DATA_DIR (1-3 GB)? [y/N] " a
+read -r -p "Also delete the offline model and llama.cpp in $DATA_DIR (~1 GB)? [y/N] " a
 if [[ ${a:-} =~ ^[yY] ]]; then rm -rf "$DATA_DIR"; else rm -rf "$DATA_DIR/shell" "$DATA_DIR/prompts"; fi
-read -r -p "Delete the configuration in $CONF_DIR? [y/N] " a
+read -r -p "Delete the configuration and the Gemini API key in $CONF_DIR? [y/N] " a
 [[ ${a:-} =~ ^[yY] ]] && rm -rf "$CONF_DIR"
 echo "terhm removed."

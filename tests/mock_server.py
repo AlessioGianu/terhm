@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
-"""Fake llama-server for the tests: answers /health and /v1/chat/completions."""
+"""Fake servers for the tests: llama-server (/health, /v1/chat/completions) and the
+Gemini OpenAI-compatible API (/gemini/chat/completions, /gemini/models/<model>).
+Gemini accepts the key "goodkey"; the model "down" answers 503."""
 import json, os, sys
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
@@ -32,24 +34,28 @@ class H(BaseHTTPRequestHandler):
         b = json.dumps(obj).encode()
         self.send_response(200); self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(b))); self.end_headers(); self.wfile.write(b)
+    def _err(self, code, msg):
+        b = json.dumps([{"error": {"code": code, "message": msg}}]).encode()
+        self.send_response(code); self.send_header("Content-Length", str(len(b))); self.end_headers(); self.wfile.write(b)
+    def _gemini_auth(self):
+        if self.headers.get("Authorization") != "Bearer goodkey":
+            self._err(400, "API key not valid. Please pass a valid API key."); return False
+        return True
     def do_GET(self):
+        if self.path.startswith("/gemini/"):
+            if not self._gemini_auth(): return
+            if self.path != "/gemini/models/gemini-test": return self._err(404, "model not found")
         self._send({"status": "ok"})
     def do_POST(self):
         body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+        body["_path"] = self.path
         with open(LOG, "w") as f: json.dump(body, f)
+        if self.path.startswith("/gemini/"):
+            if not self._gemini_auth(): return
+            if body.get("model") == "down": return self._err(503, "overloaded")
         out = answer(body)
-        # alternative at 0.7 (reasoning alone uses 0.6)
+        # alternative at 0.7
         if body.get("temperature", 0) > 0.65 and out and "</think>" not in out: out += " # alt"
-        users = [m["content"] for m in body["messages"] if m["role"] == "user"]
-        thinking = body.get("chat_template_kwargs", {}).get("enable_thinking", True)
-        if ("budgetthink" in users[0].lower() or "longthink" in users[0].lower()) and not thinking:   # second request after the budget
-            out = " git status" if "notes so far" in users[-1] and "they want git" in users[-1] else " ls"
-        elif "longthink" in users[0].lower():   # max_tokens reached, reasoning left in content
-            self._send({"choices": [{"finish_reason": "length",
-                        "message": {"role": "assistant", "content": "Okay, so the user wants"}}]}); return
-        elif "budgetthink" in users[0].lower():   # max_tokens reached, reasoning extracted
-            self._send({"choices": [{"finish_reason": "length", "message": {"role": "assistant",
-                        "content": "", "reasoning_content": "Status of the repo: they want git"}}]}); return
         self._send({"choices": [{"finish_reason": "stop", "message": {"role": "assistant", "content": out}}]})
 
 HTTPServer(("127.0.0.1", int(sys.argv[1])), H).serve_forever()

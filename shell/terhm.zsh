@@ -23,7 +23,7 @@ _terhm_precmd() {
   if (( TERHM_LAST_STATUS == 0 || TERHM_LAST_STATUS >= 128 )); then _terhm_tries=0; return 0; fi
   [[ $TERHM_AUTOFIX == 1 ]] && (( _terhm_tries < TERHM_AUTOFIX_MAX )) || return 0
   (( _terhm_tries++ ))
-  print -nu2 "\e[2mterhm: command failed (exit $TERHM_LAST_STATUS), looking for a fix…\e[0m"
+  print -nu2 "\e[2mterhm: command failed (exit $TERHM_LAST_STATUS), looking for a fix… [$(command terhm mode 2>/dev/null)]\e[0m"
   fix=$(TERHM_SHELL=zsh TERHM_KNOWN="$(_terhm_known)" TERHM_HISTORY="$(_terhm_hist)" \
         command terhm fix --status "$TERHM_LAST_STATUS" --request "$_terhm_orig" -- "$last" 2>/dev/null)
   print -nu2 "\r\e[K"
@@ -52,7 +52,7 @@ terhm-suggest() {
     fi
   fi
   errf=$(mktemp "${TMPDIR:-/tmp}/terhm.XXXXXX")
-  zle -R "terhm: thinking…"
+  zle -R "terhm: thinking… [$(command terhm mode 2>/dev/null)]"
   if (( fix )); then
     [[ $last == "$_terhm_out" ]] && req="$_terhm_orig" || req=""
     out=$(TERHM_SHELL=zsh TERHM_KNOWN="$(_terhm_known)" TERHM_HISTORY="$hist" \
@@ -70,7 +70,10 @@ terhm-suggest() {
   _terhm_out="$out"; _terhm_tries=0
   BUFFER="$out"; CURSOR=${#BUFFER}
   if command terhm danger -- "$out"; then
-    zle -M "⚠ terhm: potentially dangerous command, check it before pressing Enter"
+    zle -M "⚠ terhm: potentially dangerous command, check it before pressing Enter${msg:+
+$msg}"
+  elif [[ -n $msg ]]; then
+    zle -M "$msg"                                  # e.g. Gemini not reachable, offline model used
   fi
 }
 zle -N terhm-suggest

@@ -26,7 +26,8 @@ _terhm_pc() {
   [[ $TERHM_AUTOFIX == 1 ]] && (( _terhm_tries < TERHM_AUTOFIX_MAX )) || return 0
   _terhm_tries=$((_terhm_tries + 1))
   printf '\e[2mterhm: command failed (exit %s), looking for a fix…\e[0m' "$TERHM_LAST_STATUS" >&2
-  fix=$(TERHM_SHELL=bash TERHM_KNOWN="$(_terhm_known)" \
+  fix=$(TERHM_SHELL=bash TERHM_KNOWN="$(_terhm_known)" TERHM_PROGRESS=1 \
+        TERHM_PROGRESS_MSG="command failed (exit $TERHM_LAST_STATUS), looking for a fix…" \
         TERHM_HISTORY="$(HISTTIMEFORMAT='' history 5 | sed 's/^[[:space:]]*[0-9]*[[:space:]]*//' | paste -sd';' -)" \
         command terhm fix --status "$TERHM_LAST_STATUS" --request "$_terhm_orig" -- "$last" 2>/dev/null)
   printf '\r\e[K' >&2
@@ -179,10 +180,10 @@ _terhm_suggest() {
   printf '\r\e[K\e[2mterhm: thinking…\e[0m' >&2   # readline redraws the line afterwards
   if (( fix )); then
     [[ $last == "$_terhm_out" ]] && req="$_terhm_orig" || req=""
-    out=$(TERHM_SHELL=bash TERHM_KNOWN="$(_terhm_known)" TERHM_HISTORY="$hist" \
+    out=$(TERHM_SHELL=bash TERHM_KNOWN="$(_terhm_known)" TERHM_HISTORY="$hist" TERHM_PROGRESS=1 \
           command terhm fix --status "$st" --request "$req" -- "$last" 2>"$errf")
   else
-    out=$(TERHM_SHELL=bash TERHM_KNOWN="$(_terhm_known)" TERHM_ALT=$alt TERHM_PREV="$_terhm_out" \
+    out=$(TERHM_SHELL=bash TERHM_KNOWN="$(_terhm_known)" TERHM_ALT=$alt TERHM_PREV="$_terhm_out" TERHM_PROGRESS=1 \
           command terhm ask "$req" 2>"$errf")
   fi
   rc=$?
@@ -191,6 +192,7 @@ _terhm_suggest() {
   if (( rc != 0 )) || [[ -z $out ]]; then
     printf '%s\n' "${msg:-terhm: no response}" >&2; return 0
   fi
+  [[ -n $msg ]] && printf '\e[2m%s\e[0m\n' "$msg" >&2   # e.g. Gemini not reachable, offline model used
   (( alt || fix )) || _terhm_orig="$req"
   _terhm_out="$out"; _terhm_tries=0
   _terhm_set "$out"
